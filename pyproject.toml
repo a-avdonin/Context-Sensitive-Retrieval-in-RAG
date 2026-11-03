@@ -1,0 +1,28 @@
+[project]
+name = "arag"
+version = "0.1.0"
+description = "Context-sensitive adaptive retrieval for multi-turn RAG (НИР ИТМО)"
+requires-python = ">=3.10"
+dependencies = [
+    "bm25s>=0.2",
+    "PyStemmer",
+    "pytrec_eval-terrier",
+    "numpy",
+    "pyyaml",
+    "tqdm",
+    "openai>=1.40",
+]
+
+[project.optional-dependencies]
+neural = ["torch", "sentence-transformers>=3.0"]
+dev = ["pytest", "pandas", "matplotlib"]
+
+[project.scripts]
+arag = "arag.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
