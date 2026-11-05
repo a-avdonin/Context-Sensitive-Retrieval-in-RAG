@@ -123,6 +123,20 @@ def cmd_eval(cfg, args):
     print(f"\nsaved {out}")
 
 
+def is_deployable(strategy: str) -> bool:
+    """gold_rewrite использует human rewrite, недоступный при инференсе: только верхняя граница."""
+    return Strategy.parse(strategy).query != "gold_rewrite"
+
+
+def oracle_pick(scores: dict[str, float], eps: float = 0.0) -> tuple[str, float]:
+    """Самая дешёвая стратегия с качеством не ниже best - eps. При eps=0 — лучшая, ничьи к дешёвой."""
+    order = {s: i for i, s in enumerate(all_strategies())}
+    best = max(scores.values())
+    ok = [s for s, v in scores.items() if v >= best - eps - 1e-12]
+    s = min(ok, key=lambda s: (cost_rank(s), -scores[s], order.get(s, 0)))
+    return s, scores[s]
+
+
 def cmd_oracle(cfg, args):
     tasks, qrels = _tasks(cfg, args)
     by = {t.task_id: t for t in tasks}
@@ -130,25 +144,75 @@ def cmd_oracle(cfg, args):
     metric = cfg["eval"]["oracle_metric"]
     per_strategy = {s: per_query(qrels, records_to_run([r for r in recs if r["task_id"] in by]),
                                  cfg["eval"]["k_values"]) for s, recs in runs.items()}
-    order = {s: i for i, s in enumerate(all_strategies())}
-    labels, best_scores = [], []
+    deployable = [s for s in per_strategy if is_deployable(s)]
+    if not deployable:
+        raise SystemExit("нет runs с реализуемыми стратегиями (все gold_rewrite)")
+
+    labels = []
     for tid in by:
-        cands = [(sc[tid][metric], -cost_rank(s), -order.get(s, 0), s) for s, sc in per_strategy.items() if tid in sc]
-        if not cands:
+        scores = {s: sc[tid][metric] for s, sc in per_strategy.items() if tid in sc}
+        dep = {s: v for s, v in scores.items() if s in deployable}
+        if not dep:
             continue
-        best = max(cands)
-        labels.append({"task_id": tid, "domain": by[tid].domain, "best": best[3], metric: best[0],
-                       "solvable": best[0] > 0,
-                       "scores": {s: sc[tid][metric] for s, sc in per_strategy.items() if tid in sc}})
-        best_scores.append(best[0])
+        best, best_v = oracle_pick(dep)
+        cheap, cheap_v = oracle_pick(dep, args.eps)
+        gold, gold_v = oracle_pick(scores)
+        labels.append({"task_id": tid, "domain": by[tid].domain, "user_turn": by[tid].user_turn,
+                       "best": best, metric: best_v, "solvable": best_v > 0,
+                       "best_cheap": cheap, f"{metric}_cheap": cheap_v,
+                       "best_with_gold": gold, f"{metric}_with_gold": gold_v,
+                       "scores": scores})
     write_jsonl(Path(cfg["runs_dir"]) / f"{args.dataset}_oracle.jsonl", labels)
 
-    unsolved = sum(not l["solvable"] for l in labels)
-    print(f"oracle {metric}: {sum(best_scores) / len(best_scores):.4f} over {len(best_scores)} queries "
-          f"({unsolved} with zero score for every strategy)")
+    mean = lambda key: sum(l[key] for l in labels) / max(len(labels), 1)
+    fixed_best = max(deployable, key=lambda s: aggregate(per_strategy[s]).get(metric, 0))
+    print(f"queries: {len(labels)}, unsolvable (0 for every deployable strategy): "
+          f"{sum(not l['solvable'] for l in labels)}")
+    print(f"best fixed (deployable) {fixed_best:28s} {metric}={aggregate(per_strategy[fixed_best])[metric]:.4f}")
+    print(f"oracle (deployable)                           {metric}={mean(metric):.4f}")
+    print(f"oracle cheap, eps={args.eps:<4}                        {metric}={mean(f'{metric}_cheap'):.4f}  "
+          f"avg cost_rank={sum(cost_rank(l['best_cheap']) for l in labels) / max(len(labels), 1):.2f}")
+    print(f"oracle incl. gold_rewrite (upper bound)       {metric}={mean(f'{metric}_with_gold'):.4f}\n")
     for s, sc in sorted(per_strategy.items(), key=lambda x: -aggregate(x[1]).get(metric, 0)):
         wins = sum(l["best"] == s and l["solvable"] for l in labels)
-        print(f"{s:32s} {metric}={aggregate(sc)[metric]:.4f}  oracle_picks={wins}")
+        tag = "" if s in deployable else "  (not deployable)"
+        print(f"{s:32s} {metric}={aggregate(sc)[metric]:.4f}  oracle_picks={wins}{tag}")
+
+
+def cmd_significance(cfg, args):
+    import numpy as np
+
+    from .stats import holm, paired_bootstrap, randomization_test
+
+    tasks, qrels = _tasks(cfg, args)
+    slices, by = _slices(tasks)
+    systems = _load_runs(cfg, args.dataset)
+    routes_dir = Path(cfg["runs_dir"]) / f"{args.dataset}_routes"
+    systems |= {f"route/{p.stem}": read_jsonl(p) for p in sorted(routes_dir.glob("*.jsonl"))}
+    if args.baseline not in systems:
+        raise SystemExit(f"нет run для {args.baseline}; есть: {', '.join(systems)}")
+
+    keep = slices[args.slice]
+    scores = {s: per_query(qrels, records_to_run([r for r in recs if r["task_id"] in by and keep(r["task_id"])]),
+                           cfg["eval"]["k_values"]) for s, recs in systems.items()}
+    base = scores[args.baseline]
+    rows = []
+    for s, sc in scores.items():
+        if s == args.baseline:
+            continue
+        common = sorted(set(base) & set(sc))
+        if not common:
+            continue
+        a = np.array([base[q][args.metric] for q in common])
+        b = np.array([sc[q][args.metric] for q in common])
+        delta, lo, hi = paired_bootstrap(a, b, args.n)
+        rows.append({"system": s, "n": len(common), "baseline": a.mean(), "system_score": b.mean(),
+                     "delta": delta, "ci_low": lo, "ci_high": hi, "p": randomization_test(a, b, args.n)})
+    for r, p in zip(rows, holm([r["p"] for r in rows])):
+        r["p_holm"] = p
+    print(f"baseline={args.baseline}  metric={args.metric}  slice={args.slice}\n")
+    _print_table(sorted(rows, key=lambda r: -r["delta"]),
+                 ["system", "n", "baseline", "system_score", "delta", "ci_low", "ci_high", "p", "p_holm"])
 
 
 def cmd_route(cfg, args):
@@ -233,6 +297,14 @@ def main():
 
     sp = sub.add_parser("oracle", help="лучшая стратегия на каждый запрос и верхняя граница")
     common(sp)
+    sp.add_argument("--eps", type=float, default=0.05, help="допуск для cost-aware оракула")
+
+    sp = sub.add_parser("significance", help="парные тесты: все runs и роутеры против baseline")
+    common(sp)
+    sp.add_argument("--baseline", required=True, help="стратегия (last:bm25) или route/<имя>")
+    sp.add_argument("--metric", default="ndcg_cut_5")
+    sp.add_argument("--slice", default="all", choices=["all", "first_turn", "later_turns"])
+    sp.add_argument("--n", type=int, default=10000, help="число bootstrap/перестановок")
 
     sp = sub.add_parser("route", help="оценить роутер")
     common(sp)
@@ -246,7 +318,8 @@ def main():
 
     args = p.parse_args()
     cfg = load_config(args.config)
-    cmds = {"run": cmd_run, "eval": cmd_eval, "oracle": cmd_oracle, "route": cmd_route, "answer": cmd_answer}
+    cmds = {"run": cmd_run, "eval": cmd_eval, "oracle": cmd_oracle, "significance": cmd_significance,
+            "route": cmd_route, "answer": cmd_answer}
     cmds[args.cmd](cfg, args)
 
 
