@@ -63,3 +63,26 @@ def test_llm_router_history_and_fallback():
     assert "What is NAV?" not in nohist.llm.calls[0]
     bad = LLMRouter(FakeLLM("no json"), "m", True)
     assert bad.route(t).strategy == bad.fallback
+
+
+def test_oracle_pick_and_deployable():
+    from arag.cli import is_deployable, oracle_pick
+
+    assert not is_deployable("gold_rewrite:bm25") and is_deployable("last:hybrid+rerank")
+    scores = {"last:bm25": 0.5, "last:hybrid+rerank": 0.55, "llm_rewrite:dense": 0.55}
+    assert oracle_pick(scores)[0] == "last:hybrid+rerank"  # ничья → дешевле
+    assert oracle_pick(scores, eps=0.1)[0] == "last:bm25"
+
+
+def test_stats():
+    import numpy as np
+
+    from arag.stats import holm, paired_bootstrap, randomization_test
+
+    a = np.zeros(200)
+    b = np.r_[np.ones(100), np.zeros(100)] * 0.2
+    d, lo, hi = paired_bootstrap(a, b, 2000)
+    assert abs(d - 0.1) < 1e-9 and lo > 0 and hi < 0.2
+    assert randomization_test(a, b, 2000) < 0.01
+    assert randomization_test(a, a) == 1.0
+    assert holm([0.01, 0.04, 0.03]) == [0.03, 0.06, 0.06]
