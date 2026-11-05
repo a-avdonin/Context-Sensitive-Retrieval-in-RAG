@@ -179,6 +179,22 @@ def cmd_oracle(cfg, args):
         print(f"{s:32s} {metric}={aggregate(sc)[metric]:.4f}  oracle_picks={wins}{tag}")
 
 
+def cmd_analyze(cfg, args):
+    from .analysis import build_report
+
+    tasks, qrels = _tasks(cfg, args)
+    by = {t.task_id: t for t in tasks}
+    runs = _load_runs(cfg, args.dataset)
+    scores = {s: per_query(qrels, records_to_run([r for r in recs if r["task_id"] in by]), cfg["eval"]["k_values"])
+              for s, recs in runs.items()}
+    report = build_report(tasks, qrels, scores, args.metric, args.dataset)
+    out = Path(args.out) if args.out else Path(cfg["runs_dir"]) / f"{args.dataset}_analysis.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report)
+    print(report)
+    print(f"\nsaved {out}")
+
+
 def cmd_significance(cfg, args):
     import numpy as np
 
@@ -299,7 +315,12 @@ def main():
     common(sp)
     sp.add_argument("--eps", type=float, default=0.05, help="допуск для cost-aware оракула")
 
-    sp = sub.add_parser("significance", help="парные тесты: все runs и роутеры против baseline")
+    sp = sub.add_parser("analyze", help="анализ датасета, срезов и оракула → markdown")
+    common(sp)
+    sp.add_argument("--metric", default="ndcg_cut_5")
+    sp.add_argument("--out", help="путь к .md (по умолчанию runs/<dataset>_analysis.md)")
+
+    sp = sub.add_parser("significance",help="парные тесты: все runs и роутеры против baseline")
     common(sp)
     sp.add_argument("--baseline", required=True, help="стратегия (last:bm25) или route/<имя>")
     sp.add_argument("--metric", default="ndcg_cut_5")
@@ -318,7 +339,7 @@ def main():
 
     args = p.parse_args()
     cfg = load_config(args.config)
-    cmds = {"run": cmd_run, "eval": cmd_eval, "oracle": cmd_oracle, "significance": cmd_significance,
+    cmds = {"run": cmd_run, "eval": cmd_eval, "oracle": cmd_oracle, "analyze": cmd_analyze, "significance": cmd_significance,
             "route": cmd_route, "answer": cmd_answer}
     cmds[args.cmd](cfg, args)
 

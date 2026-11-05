@@ -2,6 +2,8 @@
 
 НИР, ИТМО, 2026/27. Роутер анализирует запрос и историю диалога и выбирает стратегию retrieval: формирование запроса, ретривер, reranking. Сравниваем три режима: фиксированный пайплайн, адаптацию без истории, адаптацию с историей.
 
+Журнал исследования, методика и результаты: [docs/](docs/README.md).
+
 ## Установка
 
 ```bash
@@ -42,6 +44,7 @@ arag eval --slice later_turns                         # таблица метр�
 arag eval --by-domain
 
 arag oracle --eps 0.05                                # лучшая стратегия на каждый запрос → разметка для роутера
+arag analyze --out docs/results/mtrag_analysis.md          # отчёт: датасет, срезы, оракул, когда помогает rewrite
 arag significance --baseline last:bm25 --slice later_turns   # парный bootstrap + рандомизационный тест, поправка Холма
 
 arag route --router fixed --fixed last:hybrid+rerank  # фиксированный пайплайн
