@@ -25,7 +25,7 @@ MTRAG (IBM, `data/mt-rag-benchmark`), часть `mtrag-human`: 842 задачи
 | retriever | `bm25` (bm25s, стемминг, стоп-слова); `dense` — `bge-m3` через `/v1/embeddings` сервера лаборатории, cosine по нормированным векторам, пассажи обрезаются до 8000 символов; `hybrid` — RRF по bm25 и dense (top-100 каждого), k=60 |
 | `+rerank` | cross-encoder bge-reranker-v2-m3 по top-50 кандидатам |
 
-**Реализуемая (deployable) стратегия** — любая, кроме `gold_rewrite:*`. Human rewrite на инференсе недоступен, поэтому `gold_rewrite` — это только потолок для любых методов переписывания запроса.
+**Реализуемая (deployable) стратегия** — любая, кроме `gold_rewrite:*`. Human rewrite на инференсе недоступен, поэтому `gold_rewrite` используется только для сравнения. **Это не потолок**: при dense-поиске `llm_rewrite` значимо лучше (+0.032, см. журнал за 16.11). Human rewrite в MTRAG минимальный: он только делает вопрос самостоятельным и не расширяет его. Поэтому в тексте работы — «human rewrite baseline».
 
 **Стоимость стратегии** (`cost_rank` в `cli.py`) — условный ранг для разрешения ничьих: `llm_rewrite` = 3, `dense` = 1, `hybrid` = 1.5, `rerank` = 2, остальное 0. Реальная стоимость (latency, токены, пары для reranker) пишется в каждый run.
 
