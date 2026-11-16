@@ -41,6 +41,7 @@ class RunRecord:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     rerank_pairs: int = 0
+    reranker: str = ""  # модель reranker'а: при смене модели run надо пересчитать (--overwrite)
 
 
 class Engine:
@@ -85,7 +86,8 @@ class Engine:
     def reranker(self):
         if self._reranker is None:
             c = self.cfg["reranker"]
-            self._reranker = Reranker(c["model"], c["batch_size"], self.cfg["dense"]["device"])
+            self._reranker = Reranker(c["model"], c.get("batch_size", 32), c.get("device"), c.get("max_length", 512),
+                                      Path(self.cfg["cache_dir"]) / "rerank_cache.sqlite")
         return self._reranker
 
     def prepare(self, domain: str, s: Strategy):
@@ -125,15 +127,16 @@ class Engine:
 
         pairs = 0
         if s.rerank:
-            t0 = time.perf_counter()
             cand = hits[: self.cfg["reranker"]["candidates"]]
             pairs = len(cand)
-            hits = self.reranker().rerank(q.text, cand, self.corpus(task.domain), rc["top_k"])
-            lat["rerank"] = (time.perf_counter() - t0) * 1000
+            rr = self.reranker()
+            hits = rr.rerank(q.text, cand, self.corpus(task.domain), rc["top_k"])
+            lat["rerank"] = rr.last_latency_ms  # per-pair время первого расчёта; кэш не занижает стоимость
         hits = hits[: rc["top_k"]]
         lat["total"] = sum(lat.values())
 
-        return RunRecord(task.task_id, str(s), q.text, hits, lat, q.prompt_tokens, q.completion_tokens, pairs)
+        return RunRecord(task.task_id, str(s), q.text, hits, lat, q.prompt_tokens, q.completion_tokens, pairs,
+                         self.cfg["reranker"]["model"] if s.rerank else "")
 
 
 def record_to_dict(r: RunRecord) -> dict:

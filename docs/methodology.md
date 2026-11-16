@@ -23,7 +23,7 @@ MTRAG (IBM, `data/mt-rag-benchmark`), часть `mtrag-human`: 842 задачи
 |---|---|
 | query | `last` — последний вопрос как есть; `user_concat` — три последние реплики пользователя через пробел; `gold_rewrite` — human rewrite; `llm_rewrite` — переписывание LLM по истории |
 | retriever | `bm25` (bm25s, стемминг, стоп-слова); `dense` — `bge-m3` через `/v1/embeddings` сервера лаборатории, cosine по нормированным векторам, пассажи обрезаются до 8000 символов; `hybrid` — RRF по bm25 и dense (top-100 каждого), k=60 |
-| `+rerank` | cross-encoder bge-reranker-v2-m3 по top-50 кандидатам |
+| `+rerank` | локальный cross-encoder (модель выбирается пилотом: `ms-marco-MiniLM-L-6-v2` или `bge-reranker-v2-m3`) по top-50 кандидатам первой стадии; оценки пар кэшируются, latency — время первого расчёта |
 
 **Реализуемая (deployable) стратегия** — любая, кроме `gold_rewrite:*`. Human rewrite на инференсе недоступен, поэтому `gold_rewrite` используется только для сравнения. **Это не потолок**: при dense-поиске `llm_rewrite` значимо лучше (+0.032, см. журнал за 16.11). Human rewrite в MTRAG минимальный: он только делает вопрос самостоятельным и не расширяет его. Поэтому в тексте работы — «human rewrite baseline».
 

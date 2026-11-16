@@ -161,16 +161,82 @@ def rrf(runs: list[Hits], k: int, rrf_k: int = 60) -> Hits:
     return sorted(fused.items(), key=lambda x: -x[1])[:k]
 
 
-class Reranker:
-    def __init__(self, model_name: str, batch_size: int = 32, device: str | None = None):
-        from sentence_transformers import CrossEncoder
+def auto_device(device: str | None = None) -> str:
+    if device:
+        return device
+    import torch
 
-        self.model = CrossEncoder(model_name, device=device)
-        self.batch_size = batch_size
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+class Reranker:
+    """Cross-encoder (sentence-transformers) с кэшем оценок пар (запрос, пассаж) на sqlite.
+
+    Разные стратегии часто дают одни и те же кандидаты для одного текста запроса, поэтому пары
+    считаются один раз. Latency для отчёта = сумма per-pair времени, измеренного при первом расчёте
+    (как будто пары считались заново), чтобы кэш не занижал стоимость стратегии.
+    """
+
+    def __init__(self, model_name: str, batch_size: int = 32, device: str | None = None, max_length: int = 512,
+                 cache_path: Path | None = None, model=None):
+        import sqlite3
+        import threading
+
+        self.model_name, self.batch_size = model_name, batch_size
+        if model is None:
+            from sentence_transformers import CrossEncoder
+
+            self.device = auto_device(device)
+            model = CrossEncoder(model_name, device=self.device, max_length=max_length)
+        else:
+            self.device = "fake"
+        self.model = model
+        self.last_latency_ms = 0.0
+        self.last_computed = 0
+        self.db = None
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._lock = threading.Lock()
+            self.db = sqlite3.connect(cache_path, check_same_thread=False)
+            self.db.execute("CREATE TABLE IF NOT EXISTS pairs (key TEXT PRIMARY KEY, score REAL, ms REAL)")
+
+    def _key(self, query: str, doc_id: str) -> str:
+        return hashlib.sha256(json.dumps([self.model_name, query, doc_id]).encode()).hexdigest()
+
+    def score(self, query: str, doc_ids: list[str], corpus: dict[str, str]) -> list[float]:
+        keys = [self._key(query, d) for d in doc_ids]
+        got: dict[str, tuple[float, float]] = {}
+        if self.db is not None:
+            with self._lock:
+                for i in range(0, len(keys), 500):
+                    chunk = keys[i:i + 500]
+                    q = f"SELECT key, score, ms FROM pairs WHERE key IN ({','.join('?' * len(chunk))})"
+                    got.update({k: (s, ms) for k, s, ms in self.db.execute(q, chunk)})
+        todo = [i for i, k in enumerate(keys) if k not in got]
+        if todo:
+            t0 = time.perf_counter()
+            scores = self.model.predict([(query, corpus[doc_ids[i]]) for i in todo], batch_size=self.batch_size,
+                                        show_progress_bar=False)
+            per_pair = (time.perf_counter() - t0) * 1000 / len(todo)
+            new = {keys[i]: (float(s), per_pair) for i, s in zip(todo, np.asarray(scores).reshape(-1))}
+            got.update(new)
+            if self.db is not None:
+                with self._lock:
+                    self.db.executemany("INSERT OR REPLACE INTO pairs VALUES (?, ?, ?)",
+                                        [(k, s, ms) for k, (s, ms) in new.items()])
+                    self.db.commit()
+        self.last_latency_ms = sum(got[k][1] for k in keys)
+        self.last_computed = len(todo)
+        return [got[k][0] for k in keys]
 
     def rerank(self, query: str, hits: Hits, corpus: dict[str, str], k: int) -> Hits:
         if not hits:
+            self.last_latency_ms, self.last_computed = 0.0, 0
             return hits
-        scores = self.model.predict([(query, corpus[d]) for d, _ in hits], batch_size=self.batch_size)
-        order = np.argsort(-np.asarray(scores))[:k]
+        scores = self.score(query, [d for d, _ in hits], corpus)
+        order = np.argsort(-np.asarray(scores), kind="stable")[:k]
         return [(hits[i][0], float(scores[i])) for i in order]

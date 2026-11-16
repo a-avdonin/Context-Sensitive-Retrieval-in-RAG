@@ -17,9 +17,14 @@ dense:
   device: null          # только для local: cuda / cpu / null = auto
 
 reranker:
-  model: BAAI/bge-reranker-v2-m3
-  candidates: 50
+  # локальный cross-encoder (нужен extra [neural]); кандидаты сравниваются в пилоте (docs/journal.md):
+  #   cross-encoder/ms-marco-MiniLM-L-6-v2 — 22M, быстрый
+  #   BAAI/bge-reranker-v2-m3              — 568M, сильнее, медленнее
+  model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  candidates: 50        # сколько кандидатов первой стадии пересортировывать
   batch_size: 32
+  max_length: 512       # токенов на пару (запрос + пассаж)
+  device: null          # null = auto: cuda → mps (Apple Silicon) → cpu
 
 llm:
   base_url: http://10.32.15.88:4000/v1  # LiteLLM лаборатории; переопределяется LLM_BASE_URL

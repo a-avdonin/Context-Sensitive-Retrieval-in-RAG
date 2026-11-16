@@ -351,6 +351,48 @@ def cmd_index(cfg, args):
         engine._dense.pop(d)  # не держим все матрицы в памяти
 
 
+def cmd_rerank_check(cfg, args):
+    """Загрузить reranker, проверить адекватность и замерить скорость на реальных пассажах (без кэша)."""
+    from .data import load_corpus
+    from .retrievers import Reranker
+
+    c = cfg["reranker"]
+    model = args.model or c["model"]
+    t0 = time.perf_counter()
+    rr = Reranker(model, args.batch_size or c.get("batch_size", 32), args.device or c.get("device"),
+                  c.get("max_length", 512), cache_path=None)
+    print(f"model: {model}  device: {rr.device}  загрузка {time.perf_counter() - t0:.1f} с")
+
+    toy = {"nav": "The net asset value (NAV) of a mutual fund is its assets minus liabilities divided by shares.",
+           "cap": "Market capitalization equals share price times the number of shares outstanding.",
+           "k8s": "Kubernetes pods are the smallest deployable units of computing in a cluster."}
+    s = rr.score("How is the NAV of a mutual fund calculated?", list(toy), toy)
+    ok = s[0] > s[1] > s[2] or (s[0] > s[1] and s[0] > s[2])
+    print(f"sanity: nav={s[0]:.3f} cap={s[1]:.3f} k8s={s[2]:.3f} → {'OK' if ok else 'ПОДОЗРИТЕЛЬНО'}")
+
+    # скорость: реальные запросы и BM25-кандидаты (BM25 локальный и быстрый, к API не обращаемся)
+    tasks, _ = load_tasks(cfg["data_dir"], "mtrag", [args.domain])
+    tasks = [t for t in tasks if t.meta["has_qrels"]][: args.queries]
+    engine = Engine(cfg, None)
+    corpus = load_corpus(cfg["data_dir"], args.domain)
+    n_cand = c["candidates"]
+    jobs = [(t.query, [d for d, _ in engine.bm25(args.domain).search(t.query, n_cand)]) for t in tasks]
+    rr.score(jobs[0][0], jobs[0][1][:4], corpus)  # прогрев
+    t0 = time.perf_counter()
+    pairs = 0
+    for q, docs in jobs:
+        rr.score(q, docs, corpus)
+        pairs += len(docs)
+    sec = time.perf_counter() - t0
+    pps = pairs / sec
+    per_query_ms = sec * 1000 / len(jobs)
+    print(f"скорость ({args.domain}, {len(jobs)} запросов × {n_cand} кандидатов): {pps:.0f} пар/с, "
+          f"{per_query_ms:.0f} мс на запрос")
+    n = 777
+    for name, k in [("1 стратегия", 1), ("4 ключевые (last/llm_rewrite × dense/hybrid)", 4), ("все 12 +rerank", 12)]:
+        print(f"  {name}: ≤ {k * n * n_cand / pps / 60:.0f} мин (верхняя оценка; кэш пар уменьшает)")
+
+
 def cmd_llm_check(cfg, args):
     """Без кэша: список моделей, тестовые rewrite и JSON-ответ роутера для каждой модели."""
     from .data import Task
@@ -457,7 +499,14 @@ def main():
     sp = sub.add_parser("index", help="построить dense-индексы корпусов (через API — с докачкой)")
     sp.add_argument("--domains", nargs="+", default=DOMAINS, choices=DOMAINS)
 
-    sp = sub.add_parser("llm-check",help="проверить подключение к LLM API и модели из config.yaml")
+    sp = sub.add_parser("rerank-check", help="проверить локальный reranker и замерить скорость")
+    sp.add_argument("--model", help="модель вместо reranker.model из config.yaml")
+    sp.add_argument("--domain", default="fiqa", choices=DOMAINS)
+    sp.add_argument("--queries", type=int, default=20)
+    sp.add_argument("--device", choices=["cpu", "mps", "cuda"], help="вместо reranker.device")
+    sp.add_argument("--batch-size", type=int, help="вместо reranker.batch_size")
+
+    sp = sub.add_parser("llm-check", help="проверить подключение к LLM API и модели из config.yaml")
     sp.add_argument("--models", nargs="+", help="проверить эти модели вместо моделей из конфига")
 
     sp = sub.add_parser("run", help="прогнать стратегии и сохранить runs")
@@ -501,7 +550,7 @@ def main():
     cfg = load_config(args.config)
     cmds = {"run": cmd_run, "eval": cmd_eval, "oracle": cmd_oracle, "analyze": cmd_analyze,
             "significance": cmd_significance, "route": cmd_route, "answer": cmd_answer, "llm-check": cmd_llm_check,
-            "index": cmd_index}
+            "index": cmd_index, "rerank-check": cmd_rerank_check}
     cmds[args.cmd](cfg, args)
 
 
