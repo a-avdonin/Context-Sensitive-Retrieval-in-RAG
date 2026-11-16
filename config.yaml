@@ -45,6 +45,12 @@ llm:
     chat_template_kwargs:
       enable_thinking: false
 
+routers:
+  rule:                 # rewrite только для зависимых от контекста вопросов; reranker всегда
+    first_turn: last:dense+rerank
+    standalone: last:dense+rerank
+    dependent: llm_rewrite:dense+rerank
+
 eval:
   k_values: [1, 3, 5, 10]
   oracle_metric: ndcg_cut_5
