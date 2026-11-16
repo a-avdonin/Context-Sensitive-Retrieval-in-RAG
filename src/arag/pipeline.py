@@ -42,6 +42,7 @@ class RunRecord:
     completion_tokens: int = 0
     rerank_pairs: int = 0
     reranker: str = ""  # модель reranker'а: при смене модели run надо пересчитать (--overwrite)
+    query_info: dict | None = None  # промежуточные шаги формирования запроса (CHIQ)
 
 
 class Engine:
@@ -130,13 +131,13 @@ class Engine:
             cand = hits[: self.cfg["reranker"]["candidates"]]
             pairs = len(cand)
             rr = self.reranker()
-            hits = rr.rerank(q.text, cand, self.corpus(task.domain), rc["top_k"])
+            hits = rr.rerank(q.rerank_text or q.text, cand, self.corpus(task.domain), rc["top_k"])
             lat["rerank"] = rr.last_latency_ms  # per-pair время первого расчёта; кэш не занижает стоимость
         hits = hits[: rc["top_k"]]
         lat["total"] = sum(lat.values())
 
         return RunRecord(task.task_id, str(s), q.text, hits, lat, q.prompt_tokens, q.completion_tokens, pairs,
-                         self.cfg["reranker"]["model"] if s.rerank else "")
+                         self.cfg["reranker"]["model"] if s.rerank else "", q.info or None)
 
 
 def record_to_dict(r: RunRecord) -> dict:
