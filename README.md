@@ -29,7 +29,7 @@ cp .env.example .env && source .env
 
 - query: `last` · `user_concat` (последние 3 реплики пользователя) · `gold_rewrite` (human rewrite, верхняя граница для rewrite) · `llm_rewrite`
 - retriever: `bm25` · `dense` (`bge-m3` через `/v1/embeddings` сервера; `dense.backend: local` — sentence-transformers) · `hybrid` (RRF)
-- `+rerank`: cross-encoder по top-50
+- `+rerank`: локальный cross-encoder по top-50 (`reranker.model` в `config.yaml`, проверка: `arag rerank-check`)
 
 Всего 24 стратегии (`all`), из них 12 без LLM (`no_llm`) и 12 без reranker (`no_rerank`). Reranker пока требует локальный cross-encoder (`[neural]`), на сервере его нет.
 

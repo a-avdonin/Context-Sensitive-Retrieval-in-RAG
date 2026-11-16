@@ -266,7 +266,7 @@ def cmd_route(cfg, args):
     tasks, qrels = _tasks(cfg, args)
     runs = {s: {r["task_id"]: r for r in recs} for s, recs in _load_runs(cfg, args.dataset).items()}
     llm = _llm(cfg) if args.router.startswith("llm") else None
-    router = build_router(args.router, cfg, llm, args.fixed)
+    router = build_router(args.router, cfg, llm, args.fixed, args.dataset)
     engine = None
     out = []
     # решения роутера считаем параллельно; ошибка API после всех повторов роняет прогон,
@@ -300,6 +300,50 @@ def cmd_route(cfg, args):
     for r in out:
         dist[r["route"]] += 1
     print("\nroutes:", dict(sorted(dist.items(), key=lambda x: -x[1])))
+
+
+def cmd_routes_summary(cfg, args):
+    """Сводная таблица по всем роутерам из runs/<dataset>_routes/: качество, решения и стоимость."""
+    tasks, qrels = _tasks(cfg, args)
+    slices, by = _slices(tasks)
+    keep = slices[args.slice]
+    rows = []
+    for p in sorted((Path(cfg["runs_dir"]) / f"{args.dataset}_routes").glob("*.jsonl")):
+        recs = [r for r in read_jsonl(p) if r["task_id"] in by and keep(r["task_id"])]
+        if not recs:
+            continue
+        scores = per_query(qrels, records_to_run(recs), cfg["eval"]["k_values"])
+        n = len(recs)
+        st = [Strategy.parse(r["route"]) for r in recs]
+        later = [s for s, r in zip(st, recs) if by[r["task_id"]].history]
+        row = {"router": p.stem, "n": n} | {k: v for k, v in aggregate(scores).items()
+                                             if k in ("ndcg_cut_5", "ndcg_cut_10", "recall_5", "recall_10")}
+        row |= {
+            # rewrite на первом ходе — пустая операция (LLM не вызывается), поэтому считаем долю среди later
+            "rewrite_rate": sum(s.query == "llm_rewrite" for s in later) / max(len(later), 1),
+            "rerank_rate": sum(s.rerank for s in st) / n,
+            "dense_rate": sum(s.retriever == "dense" for s in st) / n,
+            "hybrid_rate": sum(s.retriever == "hybrid" for s in st) / n,
+            "bm25_rate": sum(s.retriever == "bm25" for s in st) / n,
+            "llm_tokens": sum(r["prompt_tokens"] + r["completion_tokens"] for r in recs) / n,
+            "router_ms": sum(r["latency_ms"].get("router", 0) for r in recs) / n,
+            "latency_ms": sum(r["latency_ms"]["total"] for r in recs) / n,
+            "rerank_pairs": sum(r.get("rerank_pairs", 0) for r in recs) / n,
+            "parse_errors": sum(r.get("rationale") == "parse_error" for r in recs),
+        }
+        rows.append(row)
+    if not rows:
+        raise SystemExit("нет файлов в runs/<dataset>_routes — сначала `arag route ...`")
+    cols = ["router", "n", "ndcg_cut_5", "recall_10", "rewrite_rate", "rerank_rate", "dense_rate", "hybrid_rate",
+            "bm25_rate", "llm_tokens", "rerank_pairs", "router_ms", "latency_ms", "parse_errors"]
+    print(f"slice={args.slice}\n")
+    _print_table(sorted(rows, key=lambda r: -r["ndcg_cut_5"]), cols)
+    out = Path(cfg["runs_dir"]) / f"{args.dataset}_routes_summary_{args.slice}.csv"
+    with open(out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nsaved {out}")
 
 
 def cmd_answer(cfg, args):
@@ -349,6 +393,48 @@ def cmd_index(cfg, args):
         print(f"{d}: {len(corpus)} пассажей, матрица {r.emb.shape}, "
               f"{(time.perf_counter() - t0) / 60:.1f} мин (backend={c.get('backend', 'local')})")
         engine._dense.pop(d)  # не держим все матрицы в памяти
+
+
+def cmd_rerank_check(cfg, args):
+    """Загрузить reranker, проверить адекватность и замерить скорость на реальных пассажах (без кэша)."""
+    from .data import load_corpus
+    from .retrievers import Reranker
+
+    c = cfg["reranker"]
+    model = args.model or c["model"]
+    t0 = time.perf_counter()
+    rr = Reranker(model, args.batch_size or c.get("batch_size", 32), args.device or c.get("device"),
+                  c.get("max_length", 512), cache_path=None)
+    print(f"model: {model}  device: {rr.device}  загрузка {time.perf_counter() - t0:.1f} с")
+
+    toy = {"nav": "The net asset value (NAV) of a mutual fund is its assets minus liabilities divided by shares.",
+           "cap": "Market capitalization equals share price times the number of shares outstanding.",
+           "k8s": "Kubernetes pods are the smallest deployable units of computing in a cluster."}
+    s = rr.score("How is the NAV of a mutual fund calculated?", list(toy), toy)
+    ok = s[0] > s[1] > s[2] or (s[0] > s[1] and s[0] > s[2])
+    print(f"sanity: nav={s[0]:.3f} cap={s[1]:.3f} k8s={s[2]:.3f} → {'OK' if ok else 'ПОДОЗРИТЕЛЬНО'}")
+
+    # скорость: реальные запросы и BM25-кандидаты (BM25 локальный и быстрый, к API не обращаемся)
+    tasks, _ = load_tasks(cfg["data_dir"], "mtrag", [args.domain])
+    tasks = [t for t in tasks if t.meta["has_qrels"]][: args.queries]
+    engine = Engine(cfg, None)
+    corpus = load_corpus(cfg["data_dir"], args.domain)
+    n_cand = c["candidates"]
+    jobs = [(t.query, [d for d, _ in engine.bm25(args.domain).search(t.query, n_cand)]) for t in tasks]
+    rr.score(jobs[0][0], jobs[0][1][:4], corpus)  # прогрев
+    t0 = time.perf_counter()
+    pairs = 0
+    for q, docs in jobs:
+        rr.score(q, docs, corpus)
+        pairs += len(docs)
+    sec = time.perf_counter() - t0
+    pps = pairs / sec
+    per_query_ms = sec * 1000 / len(jobs)
+    print(f"скорость ({args.domain}, {len(jobs)} запросов × {n_cand} кандидатов): {pps:.0f} пар/с, "
+          f"{per_query_ms:.0f} мс на запрос")
+    n = 777
+    for name, k in [("1 стратегия", 1), ("4 ключевые (last/llm_rewrite × dense/hybrid)", 4), ("все 12 +rerank", 12)]:
+        print(f"  {name}: ≤ {k * n * n_cand / pps / 60:.0f} мин (верхняя оценка; кэш пар уменьшает)")
 
 
 def cmd_llm_check(cfg, args):
@@ -457,7 +543,14 @@ def main():
     sp = sub.add_parser("index", help="построить dense-индексы корпусов (через API — с докачкой)")
     sp.add_argument("--domains", nargs="+", default=DOMAINS, choices=DOMAINS)
 
-    sp = sub.add_parser("llm-check",help="проверить подключение к LLM API и модели из config.yaml")
+    sp = sub.add_parser("rerank-check", help="проверить локальный reranker и замерить скорость")
+    sp.add_argument("--model", help="модель вместо reranker.model из config.yaml")
+    sp.add_argument("--domain", default="fiqa", choices=DOMAINS)
+    sp.add_argument("--queries", type=int, default=20)
+    sp.add_argument("--device", choices=["cpu", "mps", "cuda"], help="вместо reranker.device")
+    sp.add_argument("--batch-size", type=int, help="вместо reranker.batch_size")
+
+    sp = sub.add_parser("llm-check", help="проверить подключение к LLM API и модели из config.yaml")
     sp.add_argument("--models", nargs="+", help="проверить эти модели вместо моделей из конфига")
 
     sp = sub.add_parser("run", help="прогнать стратегии и сохранить runs")
@@ -489,8 +582,13 @@ def main():
 
     sp = sub.add_parser("route", help="оценить роутер")
     common(sp)
-    sp.add_argument("--router", default="rule", choices=["fixed", "rule", "llm_nohist", "llm_hist"])
+    sp.add_argument("--router", default="rule",
+                    choices=["fixed", "rule", "llm_nohist", "llm_hist", "oracle", "oracle_cheap"])
     sp.add_argument("--fixed", default="last:hybrid+rerank")
+
+    sp = sub.add_parser("routes-summary", help="сводная таблица роутеров: качество, решения, стоимость")
+    common(sp)
+    sp.add_argument("--slice", default="all", choices=["all", "first_turn", "later_turns"])
 
     sp = sub.add_parser("answer", help="генерация ответа и LLM-as-a-Judge по файлу run")
     common(sp)
@@ -501,7 +599,8 @@ def main():
     cfg = load_config(args.config)
     cmds = {"run": cmd_run, "eval": cmd_eval, "oracle": cmd_oracle, "analyze": cmd_analyze,
             "significance": cmd_significance, "route": cmd_route, "answer": cmd_answer, "llm-check": cmd_llm_check,
-            "index": cmd_index}
+            "index": cmd_index, "rerank-check": cmd_rerank_check,
+            "routes-summary": cmd_routes_summary}
     cmds[args.cmd](cfg, args)
 
 
