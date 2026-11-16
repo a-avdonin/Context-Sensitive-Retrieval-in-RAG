@@ -266,13 +266,20 @@ def cmd_significance(cfg, args):
 def cmd_route(cfg, args):
     tasks, qrels = _tasks(cfg, args)
     runs = {s: {r["task_id"]: r for r in recs} for s, recs in _load_runs(cfg, args.dataset).items()}
-    llm = _llm(cfg) if args.router.startswith("llm") else None
+    llm = _llm(cfg) if args.router.startswith("llm") or args.router == "adaptive_rag" else None
     router = build_router(args.router, cfg, llm, args.fixed, args.dataset)
+    if hasattr(router, "prepare"):  # обучаемые роутеры: обучение + предсказания по кросс-валидации
+        rep = router.prepare(tasks, qrels)
+        print(f"{args.router}: уровни {rep['levels']}")
+        print(f"  метки (самый простой лучший уровень): {rep['label_dist']}, без метки (все 0): {rep['unlabeled']}")
+        print(f"  CV accuracy {rep['cv_accuracy']:.3f} (всегда частый класс: {rep['majority_accuracy']:.3f})")
+        print(f"  предсказано: {rep['pred_dist']}; confusion (строки — метка): {rep['confusion']}")
     engine = None
     out = []
     # решения роутера считаем параллельно; ошибка API после всех повторов роняет прогон,
     # но уже полученные ответы лежат в кэше — перезапуск продолжит с того же места
-    routes = parallel_map(router.route, tasks, _workers(cfg, args) if llm else 1, f"route:{args.router}")
+    routes = parallel_map(router.route, tasks, _workers(cfg, args) if args.router.startswith("llm") else 1,
+                          f"route:{args.router}")
     missing = [t for t, r in zip(tasks, routes)
                if t.task_id not in runs.get(r.strategy, {}) and Strategy.parse(r.strategy).query in LLM_QUERY_MODES]
     if missing:
@@ -585,7 +592,7 @@ def main():
     sp = sub.add_parser("route", help="оценить роутер")
     common(sp)
     sp.add_argument("--router", default="rule",
-                    choices=["fixed", "rule", "llm_nohist", "llm_hist", "oracle", "oracle_cheap"])
+                    choices=["fixed", "rule", "llm_nohist", "llm_hist", "adaptive_rag", "oracle", "oracle_cheap"])
     sp.add_argument("--fixed", default="last:hybrid+rerank")
 
     sp = sub.add_parser("routes-summary", help="сводная таблица роутеров: качество, решения, стоимость")

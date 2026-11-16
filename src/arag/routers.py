@@ -4,6 +4,7 @@ fixed        — один пайплайн для всех запросов
 rule         — эвристики по запросу и истории: переписывать только зависимые от контекста вопросы
 llm_nohist   — LLM видит только последний вопрос (аналог Adaptive-RAG: адаптация по сложности)
 llm_hist     — LLM видит вопрос и историю, решает про rewrite, ретривер и reranking
+adaptive_rag — Adaptive-RAG: классификатор сложности по одному вопросу выбирает уровень A/B/C
 oracle       — лучшая стратегия по разметке оракула (верхняя граница, не реализуем)
 oracle_cheap — самая дешёвая стратегия в пределах eps от лучшей (верхняя граница с учётом стоимости)
 """
@@ -134,6 +135,103 @@ class LLMRouter:
         return Route(strategy, r.prompt_tokens, r.completion_tokens, r.latency_ms, d.get("reason", ""))
 
 
+class AdaptiveRAGRouter:
+    """Adaptive-RAG (Jeong et al., NAACL 2024), адаптация к retrieval в диалоге.
+
+    Как в оригинале: классификатор сложности видит ТОЛЬКО текущий вопрос (без истории) и выбирает один из
+    уровней пайплайна возрастающей стоимости; метки строятся автоматически — самый простой уровень, который
+    даёт лучший результат на запросе (у авторов — самый простой, ответивший правильно).
+    Отличия: уровни — наши стратегии (A/B/C из config), а не no-retrieval/single-step/multi-step;
+    классификатор — логистическая регрессия на эмбеддингах bge-m3, а не дообученный T5-large;
+    запросы, где все уровни дают 0, в обучение не идут (у авторов им ставится метка по типу датасета).
+    Предсказания — кросс-валидация по диалогам (GroupKFold): модель не видела диалог задачи.
+    """
+
+    def __init__(self, llm, emb_model: str, query_prefix: str, levels: list[str], runs_dir: Path, dataset: str,
+                 metric: str = "ndcg_cut_5", eps: float = 0.0, folds: int = 5, C: float = 1.0, workers: int = 8):
+        for s in levels:
+            Strategy.parse(s)
+        self.llm, self.emb_model, self.prefix = llm, emb_model, query_prefix
+        self.levels, self.runs_dir, self.dataset = levels, Path(runs_dir), dataset
+        self.metric, self.eps, self.folds, self.C, self.workers = metric, eps, folds, C, workers
+        self.pred: dict[str, tuple[int, float]] = {}
+        self.embed_ms: dict[str, float] = {}
+        self.report: dict = {}
+
+    def _level_scores(self, tasks, qrels) -> dict[str, list[float]]:
+        from .metrics import per_query, read_jsonl, records_to_run
+
+        ids = {t.task_id for t in tasks}
+        out = {}
+        for s in self.levels:
+            path = self.runs_dir / self.dataset / f"{s.replace(':', '__')}.jsonl"
+            if not path.exists():
+                raise FileNotFoundError(f"{path}: нужен run уровня {s} (arag run --strategies {s})")
+            sc = per_query(qrels, records_to_run([r for r in read_jsonl(path) if r["task_id"] in ids]))
+            for tid in ids:
+                out.setdefault(tid, []).append(sc.get(tid, {}).get(self.metric, 0.0))
+        return out
+
+    @staticmethod
+    def label(scores: list[float], eps: float = 0.0) -> int | None:
+        """Самый простой уровень с результатом не хуже лучшего − eps; None, если все уровни дали 0."""
+        best = max(scores)
+        if best <= 0:
+            return None
+        return next(i for i, v in enumerate(scores) if v >= best - eps - 1e-12)
+
+    def prepare(self, tasks, qrels):
+        import numpy as np
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import GroupKFold
+
+        from .llm import parallel_map
+
+        scores = self._level_scores(tasks, qrels)
+        labels = [self.label(scores[t.task_id], self.eps) for t in tasks]
+        embs = parallel_map(lambda t: self.llm.embed_one(self.emb_model, self.prefix + t.query), tasks,
+                            self.workers, "adaptive_rag: query embeddings")
+        X = np.stack([v for v, _ in embs]).astype(np.float32)
+        X /= np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-12)
+        self.embed_ms = {t.task_id: ms for t, (_, ms) in zip(tasks, embs)}
+        groups = np.array([t.task_id.split("<::>")[0] for t in tasks])
+        y = np.array([-1 if l is None else l for l in labels])
+        pred = np.zeros(len(tasks), dtype=int)
+        conf = np.zeros(len(tasks))
+        for tr, te in GroupKFold(n_splits=self.folds).split(X, y, groups):
+            tr = tr[y[tr] >= 0]
+            if len(set(y[tr])) == 1:
+                pred[te], conf[te] = y[tr][0], 1.0
+                continue
+            clf = LogisticRegression(C=self.C, max_iter=2000).fit(X[tr], y[tr])
+            proba = clf.predict_proba(X[te])
+            pred[te] = clf.classes_[proba.argmax(1)]
+            conf[te] = proba.max(1)
+        self.pred = {t.task_id: (int(p), float(c)) for t, p, c in zip(tasks, pred, conf)}
+
+        lab = y >= 0
+        k = len(self.levels)
+        cm = [[int(((y == i) & (pred == j)).sum()) for j in range(k)] for i in range(k)]
+        self.report = {
+            "levels": self.levels,
+            "label_dist": [int((y == i).sum()) for i in range(k)],
+            "unlabeled": int((~lab).sum()),
+            "pred_dist": [int((pred == i).sum()) for i in range(k)],
+            "cv_accuracy": float((pred[lab] == y[lab]).mean()) if lab.any() else 0.0,
+            "majority_accuracy": float(max(np.bincount(y[lab], minlength=k)) / lab.sum()) if lab.any() else 0.0,
+            "confusion": cm,
+        }
+        return self.report
+
+    def route(self, task: Task) -> Route:
+        if task.task_id not in self.pred:
+            raise RuntimeError("AdaptiveRAGRouter.prepare(tasks, qrels) не вызван для этой задачи")
+        lvl, p = self.pred[task.task_id]
+        # стоимость роутера: эмбеддинг вопроса (latency первого вызова) + классификатор (~0)
+        return Route(self.levels[lvl], latency_ms=self.embed_ms.get(task.task_id, 0.0),
+                     rationale=f"level={'ABCDEFG'[lvl]} p={p:.2f}")
+
+
 def build_router(name: str, cfg: dict, llm: LLM | None = None, fixed: str = "last:hybrid+rerank",
                  dataset: str = "mtrag"):
     model, turns = cfg["llm"]["router_model"], cfg["llm"]["max_history_turns"]
@@ -141,6 +239,13 @@ def build_router(name: str, cfg: dict, llm: LLM | None = None, fixed: str = "las
         return FixedRouter(fixed)
     if name == "rule":
         return RuleRouter(**cfg.get("routers", {}).get("rule", {}))
+    if name == "adaptive_rag":
+        c, d = cfg.get("routers", {}).get("adaptive_rag", {}), cfg["dense"]
+        return AdaptiveRAGRouter(llm, d["model"], d.get("query_prefix", ""),
+                                 c.get("levels", ["last:dense", "last:dense+rerank", "llm_rewrite:dense+rerank"]),
+                                 Path(cfg["runs_dir"]), dataset, cfg["eval"].get("oracle_metric", "ndcg_cut_5"),
+                                 c.get("eps", 0.0), c.get("folds", 5), c.get("C", 1.0),
+                                 cfg["llm"].get("workers", 8))
     if name in ("oracle", "oracle_cheap"):
         return OracleRouter(Path(cfg["runs_dir"]) / f"{dataset}_oracle.jsonl",
                             "best" if name == "oracle" else "best_cheap")

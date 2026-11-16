@@ -383,3 +383,55 @@ def test_chiq_drops_refusal_pseudo_response():
     q = QueryBuilder(ChiqFakeLLM(pr="The provided context does not state this."), "m").build(t, "chiq")
     assert "provided context" not in q.text and not q.info["pseudo_response_used"]
     assert q.text == "NAV vs market cap importance Which is more important, NAV or market cap?"
+
+
+def test_adaptive_rag_router(tmp_path):
+    import json
+
+    import numpy as np
+
+    from arag.data import Task
+    from arag.routers import AdaptiveRAGRouter
+
+    assert AdaptiveRAGRouter.label([0.5, 0.5, 0.9]) == 2
+    assert AdaptiveRAGRouter.label([0.6, 0.6, 0.6]) == 0          # ничья → самый простой
+    assert AdaptiveRAGRouter.label([0.0, 0.0, 0.0]) is None       # нерешаемый → без метки
+    assert AdaptiveRAGRouter.label([0.50, 0.52, 0.0], eps=0.05) == 0
+
+    levels = ["last:dense", "last:dense+rerank", "llm_rewrite:dense+rerank"]
+    # 10 диалогов × 6 ходов; уровень, который "выигрывает", определяется словом в вопросе
+    words = ["alpha", "beta", "gamma"]
+    tasks, qrels, runs = [], {}, {s: [] for s in levels}
+    for c in range(10):
+        for k in range(6):
+            lvl = (c + k) % 3
+            tid = f"conv{c}<::>{k + 1}"
+            tasks.append(Task(tid, "fiqa", [{"speaker": "user", "text": f"{words[lvl]} question {c} {k}"}]))
+            qrels[tid] = {"rel": 1}
+            for i, s in enumerate(levels):
+                hit = "rel" if i >= lvl else "junk"   # уровни ≥ lvl находят документ, ниже — нет
+                runs[s].append({"task_id": tid, "hits": [[hit, 1.0]]})
+    tasks.append(Task("conv99<::>1", "fiqa", [{"speaker": "user", "text": "delta unsolvable"}]))
+    qrels["conv99<::>1"] = {"rel": 1}
+    for s in levels:
+        runs[s].append({"task_id": "conv99<::>1", "hits": [["junk", 1.0]]})
+    d = tmp_path / "mtrag"
+    d.mkdir()
+    for s, recs in runs.items():
+        (d / f"{s.replace(':', '__')}.jsonl").write_text("\n".join(json.dumps(r) for r in recs))
+
+    class WordEmb:
+        def embed_one(self, model, text, use_cache=True):
+            v = np.full(8, 0.01, dtype=np.float32)
+            for i, w in enumerate(words + ["delta"]):
+                if w in text:
+                    v[i] = 1.0
+            return v, 7.0
+
+    r = AdaptiveRAGRouter(WordEmb(), "bge-m3", "", levels, tmp_path, "mtrag", folds=5, C=10.0, workers=1)
+    rep = r.prepare(tasks, qrels)
+    assert rep["label_dist"] == [20, 20, 20] and rep["unlabeled"] == 1
+    assert rep["cv_accuracy"] == 1.0 and rep["majority_accuracy"] == 1 / 3
+    route = r.route(tasks[2])                                  # conv0, ход 3 → gamma → уровень C
+    assert route.strategy == "llm_rewrite:dense+rerank" and route.latency_ms == 7.0
+    assert route.rationale.startswith("level=C")
