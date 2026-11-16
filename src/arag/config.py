@@ -12,5 +12,5 @@ def load_config(path: str | None = None) -> dict:
         p = Path(cfg[key])
         cfg[key] = str(p if p.is_absolute() else ROOT / p)
     cfg["llm"]["base_url"] = os.getenv("LLM_BASE_URL", cfg["llm"].get("base_url"))
-    cfg["llm"]["api_key"] = os.getenv("LLM_API_KEY", "EMPTY")
+    cfg["llm"]["api_key"] = os.getenv("LLM_API_KEY") or os.getenv("LITELLM_API_KEY") or "EMPTY"
     return cfg

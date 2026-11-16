@@ -8,10 +8,13 @@ retrieval:
   rrf_k: 60
 
 dense:
-  model: BAAI/bge-base-en-v1.5
-  query_prefix: "Represent this sentence for searching relevant passages: "
-  batch_size: 128
-  device: null  # cuda / cpu / null = auto
+  backend: api          # api — эмбеддинги на сервере через /v1/embeddings; local — sentence-transformers
+  model: bge-m3         # для local: BAAI/bge-base-en-v1.5
+  query_prefix: ""      # bge-m3 без инструкции; для bge-base-en-v1.5: "Represent this sentence for searching relevant passages: "
+  batch_size: 64        # пассажей в одном запросе к API
+  workers: 4            # параллельных запросов при индексации корпуса
+  max_chars: 8000       # обрезка длинных пассажей (в govt есть пассаж на 187k символов)
+  device: null          # только для local: cuda / cpu / null = auto
 
 reranker:
   model: BAAI/bge-reranker-v2-m3
@@ -19,13 +22,23 @@ reranker:
   batch_size: 32
 
 llm:
-  base_url: http://localhost:8000/v1  # переопределяется LLM_BASE_URL
-  rewrite_model: qwen3.8-27b
-  router_model: qwen3.8-27b
-  generator_model: gemma-4-26b-a4b-it
-  judge_model: laya
+  base_url: http://10.32.15.88:4000/v1  # LiteLLM лаборатории; переопределяется LLM_BASE_URL
+  # имена — как отдаёт /v1/models (см. `arag llm-check`)
+  # доступны (2026-11-16): qwen3.8, gemma-4-26B-A4B-it, qwen3-vl-30b, bge-m3 (эмбеддинги)
+  rewrite_model: qwen3.8
+  router_model: qwen3.8
+  generator_model: gemma-4-26B-A4B-it
+  judge_model: qwen3.8      # другое семейство, чем генератор: меньше self-preference bias
   temperature: 0.0
   max_history_turns: 6
+  timeout: 120              # секунд на запрос
+  max_retries: 5            # повторы при 429/5xx/таймауте (экспоненциальная пауза в клиенте openai)
+  workers: 8                # параллельных запросов к API по умолчанию (--workers)
+  # уходит в каждый запрос; отключает thinking у Qwen3 (иначе рассуждения съедают max_tokens).
+  # Если сервер отвечает ошибкой на этот параметр — `arag llm-check` подскажет; тогда поставить {}
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
 
 eval:
   k_values: [1, 3, 5, 10]
