@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .data import Task, load_corpus
 from .queries import QUERY_MODES, QueryBuilder
-from .retrievers import BM25Retriever, DenseRetriever, Reranker, rrf
+from .retrievers import APIDenseRetriever, BM25Retriever, DenseRetriever, Reranker, rrf
 
 RETRIEVERS = ["bm25", "dense", "hybrid"]
 
@@ -67,9 +67,20 @@ class Engine:
     def dense(self, domain):
         if domain not in self._dense:
             c = self.cfg["dense"]
-            self._dense[domain] = DenseRetriever(self.corpus(domain), self._cache(domain), c["model"],
-                                                 c["query_prefix"], c["batch_size"], c["device"])
+            if c.get("backend", "local") == "api":
+                if self.llm is None:
+                    raise RuntimeError("dense.backend=api требует LLM-клиент (LLM_BASE_URL / LLM_API_KEY)")
+                self._dense[domain] = APIDenseRetriever(self.llm, c["model"], self.corpus(domain), self._cache(domain),
+                                                        c.get("query_prefix", ""), c.get("batch_size", 64),
+                                                        c.get("workers", 4), c.get("max_chars", 8000), desc=domain)
+            else:
+                self._dense[domain] = DenseRetriever(self.corpus(domain), self._cache(domain), c["model"],
+                                                     c["query_prefix"], c["batch_size"], c["device"])
         return self._dense[domain]
+
+    def query_text(self, task: Task, s: Strategy | str) -> str:
+        s = Strategy.parse(s) if isinstance(s, str) else s
+        return self.qb.build(task, s.query).text
 
     def reranker(self):
         if self._reranker is None:
@@ -104,7 +115,13 @@ class Engine:
         else:
             hits = rrf([self.bm25(task.domain).search(q.text, n), self.dense(task.domain).search(q.text, n)],
                        n, rc["rrf_k"])
-        lat["retrieve"] = (time.perf_counter() - t0) * 1000
+        wall = (time.perf_counter() - t0) * 1000
+        if s.retriever in ("dense", "hybrid"):
+            d = self.dense(task.domain)
+            # эмбеддинг запроса — отдельный этап; при попадании в кэш берём latency первого вызова
+            lat["embed"] = d.embed_ms
+            wall -= d.embed_wall_ms
+        lat["retrieve"] = max(wall, 0.0)
 
         pairs = 0
         if s.rerank:

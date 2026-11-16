@@ -12,7 +12,7 @@ pip install -e ".[neural,dev]"     # без [neural] работает тольк
 cp .env.example .env && source .env
 ```
 
-Модели на сервере лаборатории подключаются через OpenAI-совместимый API: `LLM_BASE_URL`, `LLM_API_KEY`. Имена моделей в `config.yaml`.
+Модели лаборатории подключаются через LiteLLM (OpenAI-совместимый API): `LLM_BASE_URL`, `LLM_API_KEY` в `.env`. Имена моделей и параметры (таймаут, повторы, `workers`, отключение thinking) в `config.yaml`. Проверка: `arag llm-check`.
 
 ## Данные
 
@@ -28,14 +28,16 @@ cp .env.example .env && source .env
 Строка вида `<query>:<retriever>[+rerank]`:
 
 - query: `last` · `user_concat` (последние 3 реплики пользователя) · `gold_rewrite` (human rewrite, верхняя граница для rewrite) · `llm_rewrite`
-- retriever: `bm25` · `dense` · `hybrid` (RRF)
+- retriever: `bm25` · `dense` (`bge-m3` через `/v1/embeddings` сервера; `dense.backend: local` — sentence-transformers) · `hybrid` (RRF)
 - `+rerank`: cross-encoder по top-50
 
-Всего 24 стратегии (`all`), из них 12 без LLM (`no_llm`).
+Всего 24 стратегии (`all`), из них 12 без LLM (`no_llm`) и 12 без reranker (`no_rerank`). Reranker пока требует локальный cross-encoder (`[neural]`), на сервере его нет.
 
 ## Команды
 
 ```bash
+arag index                                            # dense-индексы корпусов через API (один раз, с докачкой)
+arag run --strategies no_rerank                       # 12 стратегий: 4 запроса × bm25/dense/hybrid
 arag run --strategies no_llm                          # бейзлайны без LLM
 arag run --strategies llm_rewrite:hybrid+rerank       # с LLM-rewrite
 arag run --dataset mtragun --strategies all
@@ -63,7 +65,7 @@ arag answer --run runs/mtrag/llm_rewrite__hybrid+rerank.jsonl --limit 100   # г
 
 Флаг `--limit` пишет усечённый run-файл. Для полного прогона перезапустить с `--overwrite`.
 
-LLM-вызовы кэшируются в `cache/llm_cache.sqlite`. Latency при попадании в кэш берётся из первого вызова.
+LLM-вызовы кэшируются в `cache/llm_cache.sqlite`. Latency при попадании в кэш берётся из первого вызова. Запросы к API идут параллельно (`--workers`, по умолчанию 8); упавший прогон при перезапуске продолжается с кэша. Для честных замеров latency LLM-этапов запускать с `--workers 1`.
 
 ## Метрики
 

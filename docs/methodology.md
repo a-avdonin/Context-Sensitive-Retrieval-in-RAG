@@ -22,7 +22,7 @@ MTRAG (IBM, `data/mt-rag-benchmark`), часть `mtrag-human`: 842 задачи
 | Часть | Значения |
 |---|---|
 | query | `last` — последний вопрос как есть; `user_concat` — три последние реплики пользователя через пробел; `gold_rewrite` — human rewrite; `llm_rewrite` — переписывание LLM по истории |
-| retriever | `bm25` (bm25s, стемминг, стоп-слова); `dense` (bge-base-en-v1.5); `hybrid` — RRF по bm25 и dense, k=60 |
+| retriever | `bm25` (bm25s, стемминг, стоп-слова); `dense` — `bge-m3` через `/v1/embeddings` сервера лаборатории, cosine по нормированным векторам, пассажи обрезаются до 8000 символов; `hybrid` — RRF по bm25 и dense (top-100 каждого), k=60 |
 | `+rerank` | cross-encoder bge-reranker-v2-m3 по top-50 кандидатам |
 
 **Реализуемая (deployable) стратегия** — любая, кроме `gold_rewrite:*`. Human rewrite на инференсе недоступен, поэтому `gold_rewrite` — это только потолок для любых методов переписывания запроса.
@@ -44,7 +44,7 @@ MTRAG (IBM, `data/mt-rag-benchmark`), часть `mtrag-human`: 842 задачи
 ## Метрики
 
 - **Retrieval**: Recall@k и nDCG@k, k ∈ {1, 3, 5, 10}, считаются через pytrec_eval так же, как в официальном скрипте MTRAG. Основная метрика — nDCG@5.
-- **Стоимость**: latency по этапам (query, retrieve, rerank, router) в мс, LLM-токены (prompt + completion), число пар для reranker.
+- **Стоимость**: latency по этапам в мс: query (rewrite), embed (эмбеддинг запроса через API), retrieve (поиск по индексу), rerank, router. При попадании в кэш берётся latency первого вызова. Также LLM-токены (prompt + completion), число пар для reranker.
 - **Ответы** (позже): correctness, faithfulness, completeness по шкале 1–5 от LLM-судьи, который предварительно калибруется на human-оценках MTRAG.
 
 ## Срезы

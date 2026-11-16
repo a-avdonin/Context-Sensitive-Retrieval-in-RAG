@@ -101,3 +101,102 @@ def test_rewrite_stats_and_report():
     sc = {"last:bm25": {t.task_id: {"ndcg_cut_5": 0.0}}, "gold_rewrite:bm25": {t.task_id: {"ndcg_cut_5": 1.0}}}
     rep = build_report([t], {t.task_id: {"d": 1}}, sc, "ndcg_cut_5", "toy")
     assert "## 5." in rep and "| [2/3, 1] | 1 | 0.000 | 1.000 | 1.000 | 1 | 0 |" in rep
+
+
+def test_llm_helpers():
+    from arag.llm import parallel_map, parse_json, strip_think
+
+    assert strip_think("<think>a</think> hi") == "hi"
+    assert strip_think("reasoning without open tag</think>\nanswer") == "answer"
+    assert parse_json('x {"a": 1} y') == {"a": 1} and parse_json("{broken") == {} and parse_json("{a: 1}") == {}
+    assert parallel_map(lambda x: x * 2, range(20), workers=4) == [x * 2 for x in range(20)]
+
+
+def test_llm_cache_threadsafe(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from arag.llm import LLM
+
+    llm = LLM("http://x/v1", "k", str(tmp_path), extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+    calls = []
+
+    def create(**kw):
+        calls.append(kw)
+        text, fr = ("", "length") if kw["messages"][0]["content"] == "empty" else ("ok", "stop")
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text), finish_reason=fr)],
+                               usage=SimpleNamespace(prompt_tokens=3, completion_tokens=1))
+
+    monkeypatch.setattr(llm.client.chat.completions, "create", create)
+    from arag.llm import parallel_map
+
+    res = parallel_map(lambda i: llm.chat("m", [{"role": "user", "content": str(i % 5)}]), range(40), workers=8)
+    assert all(r.text == "ok" for r in res)
+    assert calls[0]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    n = len(calls)
+    assert llm.chat("m", [{"role": "user", "content": "1"}]).cached and len(calls) == n
+    llm.chat("m", [{"role": "user", "content": "empty"}])
+    llm.chat("m", [{"role": "user", "content": "empty"}])  # пустой обрезанный ответ не кэшируется
+    assert len(calls) == n + 2
+
+
+class FakeEmbedLLM:
+    """Детерминированные 'эмбеддинги': мешок слов по хэшу в 32 измерения."""
+
+    def __init__(self, fail_after=None):
+        self.batches, self.fail_after = 0, fail_after
+
+    @staticmethod
+    def vec(text):
+        import numpy as np
+
+        v = np.zeros(32, dtype=np.float32)
+        for w in text.lower().split():
+            v[sum(map(ord, w)) % 32] += 1
+        return v
+
+    def embed_batch(self, model, texts):
+        import numpy as np
+
+        self.batches += 1
+        if self.fail_after is not None and self.batches > self.fail_after:
+            raise RuntimeError("server down")
+        return np.stack([self.vec(t) for t in texts])
+
+    def embed_one(self, model, text, use_cache=True):
+        return self.vec(text), 12.5
+
+
+def test_api_dense_index_resume_and_search(tmp_path):
+    import pytest
+
+    from arag.retrievers import APIDenseRetriever, api_index_path, build_api_index
+
+    corpus = {f"d{i}": f"topic{i % 7} word{i}" for i in range(50)}
+    corpus["nav"] = "net asset value nav fund"
+    # первый прогон падает после 3 батчей → шарды сохранены, итогового файла нет
+    with pytest.raises(RuntimeError):
+        build_api_index(FakeEmbedLLM(fail_after=3), "m", corpus, tmp_path, batch_size=4, workers=1, shard_batches=1)
+    assert not api_index_path(tmp_path, "m").exists()
+    done = len(list(api_index_path(tmp_path, "m").with_suffix(".shards").glob("0*.npy")))
+    assert done == 3
+    llm = FakeEmbedLLM()
+    build_api_index(llm, "m", corpus, tmp_path, batch_size=4, workers=1, shard_batches=1)
+    assert llm.batches == 13 - 3  # 51 пассаж / 4 = 13 шардов, досчитаны только недостающие
+    r = APIDenseRetriever(FakeEmbedLLM(), "m", corpus, tmp_path, batch_size=4)
+    hits = r.search("nav fund", 3)
+    assert hits[0][0] == "nav" and len(hits) == 3 and r.embed_ms == 12.5
+    with pytest.raises(RuntimeError):  # индекс от другого корпуса не подхватывается молча
+        APIDenseRetriever(FakeEmbedLLM(), "m", {"x": "y"}, tmp_path)
+
+
+def test_engine_dense_api_latency(tmp_path):
+    from arag.pipeline import Engine
+
+    cfg = {"cache_dir": str(tmp_path), "data_dir": "", "retrieval": {"top_k": 2, "first_stage_k": 5, "rrf_k": 60},
+           "dense": {"backend": "api", "model": "m", "batch_size": 4, "workers": 1},
+           "llm": {"rewrite_model": "m", "max_history_turns": 6}}
+    eng = Engine(cfg, FakeEmbedLLM())
+    eng.corpus = lambda d: {"a": "net asset value fund", "b": "kubernetes pod", "c": "fund nav"}
+    rec = eng.run(task("What is NAV fund?"), "last:dense")
+    assert rec.latency_ms["embed"] == 12.5 and len(rec.hits) == 2
+    assert {h[0] for h in rec.hits} <= {"a", "b", "c"}

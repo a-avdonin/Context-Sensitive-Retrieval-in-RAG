@@ -1,5 +1,6 @@
 import argparse
 import csv
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -7,7 +8,7 @@ from tqdm import tqdm
 
 from .config import load_config
 from .data import DOMAINS, load_tasks
-from .llm import LLM
+from .llm import LLM, parallel_map
 from .metrics import aggregate, per_query, read_jsonl, records_to_run, write_jsonl
 from .pipeline import Engine, Strategy, all_strategies, record_to_dict
 from .routers import build_router
@@ -23,7 +24,27 @@ def cost_rank(strategy: str) -> float:
 
 def _llm(cfg):
     c = cfg["llm"]
-    return LLM(c["base_url"], c["api_key"], cfg["cache_dir"], c["temperature"])
+    return LLM(c["base_url"], c["api_key"], cfg["cache_dir"], c["temperature"], c.get("timeout", 120),
+               c.get("max_retries", 5), c.get("extra_body"))
+
+
+def _workers(cfg, args) -> int:
+    return args.workers or cfg["llm"].get("workers", 8)
+
+
+def _prefetch(fn, items, workers: int, desc: str):
+    """Параллельно прогреть кэш LLM. Ошибки не роняют прогон: упавшие вызовы повторятся в основном цикле."""
+    errors = []
+
+    def safe(x):
+        try:
+            fn(x)
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    parallel_map(safe, items, workers, desc)
+    if errors:
+        print(f"prefetch {desc}: {len(errors)} ошибок, первая: {errors[0][:300]}")
 
 
 def _tasks(cfg, args):
@@ -44,6 +65,8 @@ def _strategies(names: list[str]) -> list[str]:
             out += all_strategies()
         elif n == "no_llm":
             out += [s for s in all_strategies() if "llm_rewrite" not in s]
+        elif n == "no_rerank":  # всё, что не требует локального cross-encoder
+            out += [s for s in all_strategies() if not s.endswith("+rerank")]
         else:
             out.append(str(Strategy.parse(n)))
     return list(dict.fromkeys(out))
@@ -52,12 +75,20 @@ def _strategies(names: list[str]) -> list[str]:
 def cmd_run(cfg, args):
     tasks, _ = _tasks(cfg, args)
     strategies = _strategies(args.strategies)
-    engine = Engine(cfg, _llm(cfg) if any("llm" in s for s in strategies) else None)
+    engine = Engine(cfg, _llm(cfg))  # клиент ленивый: к API обращается, только если стратегии это нужно
     for s in strategies:
         path = _run_dir(cfg, args.dataset) / f"{s.replace(':', '__')}.jsonl"
         if path.exists() and not args.overwrite:
             print(f"skip {s}: {path} exists")
             continue
+        st = Strategy.parse(s)
+        if st.query == "llm_rewrite":
+            _prefetch(lambda t: engine.qb.build(t, st.query), [t for t in tasks if t.history], _workers(cfg, args),
+                      f"{st.query} (LLM)")
+        if st.retriever in ("dense", "hybrid") and cfg["dense"].get("backend") == "api":
+            c = cfg["dense"]
+            _prefetch(lambda t: engine.llm.embed_one(c["model"], c.get("query_prefix", "") + engine.query_text(t, st)),
+                      tasks, _workers(cfg, args), f"{s}: query embeddings")
         rows = []
         for t in tqdm(sorted(tasks, key=lambda t: t.domain), desc=s):
             rows.append(record_to_dict(engine.run(t, s)) | {"domain": t.domain})
@@ -238,8 +269,15 @@ def cmd_route(cfg, args):
     router = build_router(args.router, cfg, llm, args.fixed)
     engine = None
     out = []
-    for t in tqdm(tasks, desc=args.router):
-        route = router.route(t)
+    # решения роутера считаем параллельно; ошибка API после всех повторов роняет прогон,
+    # но уже полученные ответы лежат в кэше — перезапуск продолжит с того же места
+    routes = parallel_map(router.route, tasks, _workers(cfg, args) if llm else 1, f"route:{args.router}")
+    missing = [t for t, r in zip(tasks, routes)
+               if t.task_id not in runs.get(r.strategy, {}) and Strategy.parse(r.strategy).query == "llm_rewrite"]
+    if missing:
+        engine = Engine(cfg, llm or _llm(cfg))
+        _prefetch(lambda t: engine.qb.build(t, "llm_rewrite"), missing, _workers(cfg, args), "llm_rewrite (LLM)")
+    for t, route in tqdm(list(zip(tasks, routes)), desc=args.router):
         rec = runs.get(route.strategy, {}).get(t.task_id)
         if rec is None:
             engine = engine or Engine(cfg, llm or _llm(cfg))
@@ -273,20 +311,135 @@ def cmd_answer(cfg, args):
     src = Path(args.run)
     recs = [r for r in read_jsonl(src) if r["task_id"] in by]
     llm, c = _llm(cfg), cfg["llm"]
-    out = []
-    for r in tqdm(recs, desc="answer+judge"):
+    if c["generator_model"] == c["judge_model"]:
+        print(f"ВНИМАНИЕ: генератор и судья — одна модель ({c['judge_model']}), оценки будут завышены")
+    corpora = {d: load_corpus(cfg["data_dir"], d) for d in {by[r["task_id"]].domain for r in recs}}
+
+    def one(r):
         t = by[r["task_id"]]
-        corpus = load_corpus(cfg["data_dir"], t.domain)
+        corpus = corpora[t.domain]
         docs = [d for d, _ in r["hits"][: args.k]]
         answer, g = generate(llm, c["generator_model"], t, docs, corpus, c["max_history_turns"])
         scores, j = judge(llm, c["judge_model"], t, answer, docs, corpus, c["max_history_turns"])
-        out.append({"task_id": t.task_id, "answer": answer, "judge": scores,
-                    "gen_tokens": g.prompt_tokens + g.completion_tokens, "gen_latency_ms": g.latency_ms,
-                    "answerability": t.meta["answerability"]})
+        return {"task_id": t.task_id, "answer": answer, "judge": scores,
+                "gen_tokens": g.prompt_tokens + g.completion_tokens, "gen_latency_ms": g.latency_ms,
+                "judge_tokens": j.prompt_tokens + j.completion_tokens,
+                "answerability": t.meta["answerability"]}
+
+    out = parallel_map(one, recs, _workers(cfg, args), "answer+judge")
     write_jsonl(src.with_name(src.stem + "_answers.jsonl"), out)
     for crit in ("correctness", "faithfulness", "completeness"):
         vals = [o["judge"].get(crit) for o in out if isinstance(o["judge"].get(crit), (int, float))]
         print(f"{crit}: {sum(vals) / max(len(vals), 1):.3f} (n={len(vals)})")
+    bad = sum(not o["judge"] for o in out)
+    if bad:
+        print(f"судья не вернул разбираемый JSON в {bad} из {len(out)} случаев")
+
+
+def cmd_index(cfg, args):
+    """Построить dense-индексы корпусов заранее (через API — с докачкой после обрыва)."""
+    from .data import load_corpus
+
+    engine = Engine(cfg, _llm(cfg))
+    c = cfg["dense"]
+    for d in args.domains:
+        corpus = load_corpus(cfg["data_dir"], d)
+        t0 = time.perf_counter()
+        r = engine.dense(d)
+        print(f"{d}: {len(corpus)} пассажей, матрица {r.emb.shape}, "
+              f"{(time.perf_counter() - t0) / 60:.1f} мин (backend={c.get('backend', 'local')})")
+        engine._dense.pop(d)  # не держим все матрицы в памяти
+
+
+def cmd_llm_check(cfg, args):
+    """Без кэша: список моделей, тестовые rewrite и JSON-ответ роутера для каждой модели."""
+    from .data import Task
+    from .queries import QueryBuilder
+    from .routers import LLMRouter
+
+    c = cfg["llm"]
+    key = c["api_key"]
+    print(f"base_url: {c['base_url']}")
+    print(f"api_key:  {'не задан (EMPTY)' if key == 'EMPTY' else f'задан, {len(key)} символов'}")
+    print(f"extra_body: {c.get('extra_body') or '{}'}\n")
+    llm = _llm(cfg)
+    try:
+        available = llm.list_models()
+        print(f"/v1/models: {len(available)} моделей\n  " + "\n  ".join(available) + "\n")
+    except Exception as e:  # noqa: BLE001
+        print(f"/v1/models: ОШИБКА {e!r}\nПроверьте LLM_BASE_URL, LLM_API_KEY и доступ к сети (VPN).")
+        return
+
+    roles = {r: c[f"{r}_model"] for r in ("rewrite", "router", "generator", "judge")}
+    models = args.models or list(dict.fromkeys(roles.values()))
+    task = Task("check<::>2", "fiqa", [
+        {"speaker": "user", "text": "What's the difference between Market Cap and NAV?"},
+        {"speaker": "agent", "text": "Market cap is share price times shares outstanding; NAV is assets minus "
+                                     "liabilities per share of a fund."},
+        {"speaker": "user", "text": "Which one is more important?"}])
+
+    ok_all = True
+    for m in models:
+        used_by = [r for r, mm in roles.items() if mm == m]
+        print(f"=== {m}  (роли: {', '.join(used_by) or '—'})")
+        if m not in available:
+            print("  нет в /v1/models — проверьте имя в config.yaml")
+            ok_all = False
+            continue
+        try:
+            r = llm.chat(m, [{"role": "user", "content": "Reply with exactly one word: OK"}], max_tokens=64,
+                         use_cache=False)
+            think = "<think>" in r.text or "</think>" in r.text
+            print(f"  ping: {r.text.strip()[:60]!r}  {r.latency_ms:.0f} ms, tokens {r.prompt_tokens}+"
+                  f"{r.completion_tokens}, finish={r.finish_reason}{'  [в ответе есть thinking]' if think else ''}")
+            if r.finish_reason == "length" or think:
+                print("  ! модель рассуждает (thinking): ответы будут медленными и могут обрезаться по max_tokens.")
+
+            class NoCache:  # тестовые вызовы мимо кэша
+                def chat(self, model, messages, max_tokens=512, **kw):
+                    return llm.chat(model, messages, max_tokens, use_cache=False, **kw)
+
+            q = QueryBuilder(NoCache(), m).build(task, "llm_rewrite")
+            print(f"  rewrite: {q.text!r}  {q.latency_ms:.0f} ms, completion {q.completion_tokens} tok")
+            route = LLMRouter(NoCache(), m, use_history=True).route(task)
+            parsed = route.rationale != "parse_error"
+            print(f"  router JSON: {'OK' if parsed else 'НЕ РАЗОБРАН'} → {route.strategy}  ({route.rationale[:60]})")
+            ok_all &= parsed
+        except Exception as e:  # noqa: BLE001
+            ok_all = False
+            msg = repr(e)
+            print(f"  ОШИБКА: {msg[:400]}")
+            if c.get("extra_body") and ("chat_template_kwargs" in msg or "extra" in msg.lower()):
+                print("  ! сервер не принимает extra_body — поставьте в config.yaml `extra_body: {}`")
+    dc = cfg["dense"]
+    if dc.get("backend") == "api":
+        m = dc["model"]
+        print(f"=== {m}  (dense, /v1/embeddings)")
+        if m not in available:
+            print("  нет в /v1/models — проверьте dense.model в config.yaml")
+            ok_all = False
+        else:
+            try:
+                import numpy as np
+
+                v, ms = llm.embed_one(m, "Which one is more important, Market Cap or NAV?", use_cache=False)
+                print(f"  query: dim={len(v)}, norm={np.linalg.norm(v):.3f}, {ms:.0f} ms")
+                docs = ["Market capitalization is the share price multiplied by shares outstanding.",
+                        "The net asset value (NAV) of a fund is its assets minus liabilities per share.",
+                        "Kubernetes pods are the smallest deployable units."]
+                e = llm.embed_batch(m, docs)
+                sims = (e / np.linalg.norm(e, axis=1, keepdims=True)) @ (v / np.linalg.norm(v))
+                print(f"  cosine с запросом: {np.round(sims, 3).tolist()} (последний текст не по теме — должен быть ниже)")
+                long = ("word " * 2000)[: dc.get("max_chars", 8000)]
+                t0 = time.perf_counter()
+                llm.embed_batch(m, [long] * dc.get("batch_size", 64))
+                print(f"  батч {dc.get('batch_size', 64)} × {len(long)} символов (max_chars): OK, "
+                      f"{(time.perf_counter() - t0) * 1000:.0f} ms")
+            except Exception as e:  # noqa: BLE001
+                ok_all = False
+                print(f"  ОШИБКА: {repr(e)[:400]}")
+                print("  ! если ошибка про длину/размер — уменьшите dense.max_chars или dense.batch_size")
+    print("\nвсё готово к прогонам" if ok_all else "\nесть проблемы, см. выше")
 
 
 def main():
@@ -299,6 +452,13 @@ def main():
         sp.add_argument("--domains", nargs="+", default=DOMAINS, choices=DOMAINS)
         sp.add_argument("--limit", type=int)
         sp.add_argument("--all-tasks", action="store_true", help="включить задачи без qrels")
+        sp.add_argument("--workers", type=int, help="параллельных запросов к LLM (по умолчанию llm.workers)")
+
+    sp = sub.add_parser("index", help="построить dense-индексы корпусов (через API — с докачкой)")
+    sp.add_argument("--domains", nargs="+", default=DOMAINS, choices=DOMAINS)
+
+    sp = sub.add_parser("llm-check",help="проверить подключение к LLM API и модели из config.yaml")
+    sp.add_argument("--models", nargs="+", help="проверить эти модели вместо моделей из конфига")
 
     sp = sub.add_parser("run", help="прогнать стратегии и сохранить runs")
     common(sp)
@@ -339,8 +499,9 @@ def main():
 
     args = p.parse_args()
     cfg = load_config(args.config)
-    cmds = {"run": cmd_run, "eval": cmd_eval, "oracle": cmd_oracle, "analyze": cmd_analyze, "significance": cmd_significance,
-            "route": cmd_route, "answer": cmd_answer}
+    cmds = {"run": cmd_run, "eval": cmd_eval, "oracle": cmd_oracle, "analyze": cmd_analyze,
+            "significance": cmd_significance, "route": cmd_route, "answer": cmd_answer, "llm-check": cmd_llm_check,
+            "index": cmd_index}
     cmds[args.cmd](cfg, args)
 
 
