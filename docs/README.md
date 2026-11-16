@@ -4,9 +4,11 @@
 |---|---|
 | [journal.md](journal.md) | Журнал исследования: что сделано, зачем, результаты, решения, что дальше. Новые записи сверху. |
 | [methodology.md](methodology.md) | Определения: данные, стратегии, оракулы, метрики, срезы, тесты значимости. Сюда смотреть, если непонятно, что значит цифра. |
-| [results/](results/) | Отчёты `arag analyze`: `mtrag_bm25_analysis.md` (3 стратегии), `mtrag_norerank_analysis.md` (12), `mtrag_rerank_analysis.md` (все 24, актуальный). |
+| [results/](results/) | Отчёты по поиску `arag analyze`: `mtrag_bm25_analysis.md` (3 стратегии), `mtrag_norerank_analysis.md` (12), `mtrag_rerank_analysis.md` (24, без CHIQ). Качество ответов: `mtrag_answers.md`. Калибровка судьи: `judge_calibration_qwen.md` (v1), `judge_calibration_qwen_v2.md` (актуальная). |
 
 ## Где мы сейчас (16.11.2026)
+
+Этапы 3 и 4 плана закрыты. Осталось: MTRAG-UN (этап 2) и презентация (этап 5). Краткая версия — в [README проекта](../README.md).
 
 MTRAG, 777 задач с qrels; срез — последующие ходы (n = 675), метрика nDCG@5. Подробности и значимость — в журнале.
 
@@ -48,7 +50,7 @@ Adaptive-RAG даёт качество как у `rule` при в 1.7 раза �
 | `last:dense` | 3.22 | 1726 |
 | оракул | 3.69 | 1873 |
 
-Ранжирование систем по ответам совпадает с ранжированием по поиску (ρ = 0.97), но разрыв меньше: узкое место смещается в генерацию. Судья `qwen3.8` согласуется с людьми на уровне ρ ≈ 0.5–0.6 (калибровка на 477 ответах MTRAG).
+Ранжирование систем по ответам совпадает с ранжированием по поиску (ρ = 0.97), но разрыв меньше: узкое место смещается в генерацию. Судья `qwen3.8` согласуется с людьми на уровне ρ ≈ 0.40–0.63 (калибровка на 477 ответах MTRAG).
 
 **Ключевые выводы на сейчас:**
 - dense намного сильнее BM25;
@@ -76,11 +78,16 @@ source .env
 arag llm-check                     # API, модели, bge-m3
 arag rerank-check                  # reranker и его скорость
 caffeinate -i arag index           # dense-индексы через API, ~12 мин, с докачкой
-caffeinate -i arag run --strategies all    # 24 стратегии; готовые пропускаются, LLM/эмбеддинги/пары в кэше
+caffeinate -i arag run --strategies all    # 30 стратегий (вкл. CHIQ); готовые пропускаются, LLM/эмбеддинги/пары в кэше
 arag eval --slice later_turns
 arag oracle
 arag significance --baseline last:dense --slice later_turns
 arag analyze --out docs/results/mtrag_analysis.md
+for r in rule llm_nohist llm_hist adaptive_rag oracle; do arag route --router $r; done
+arag routes-summary --slice later_turns
+arag judge-calibrate --out docs/results/judge_calibration_qwen_v2.md
+arag answer --run "runs/mtrag/llm_rewrite__dense+rerank.jsonl" runs/mtrag_routes/rule.jsonl   # и др. системы
+arag answers-summary --slice later_turns --baseline "llm_rewrite:dense+rerank"
 pytest -q
 ```
 

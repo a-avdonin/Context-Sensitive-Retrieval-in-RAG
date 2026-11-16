@@ -1,18 +1,69 @@
 # Context-Sensitive Adaptive Retrieval в multi-turn RAG
 
-НИР, ИТМО, 2026/27. Роутер анализирует запрос и историю диалога и выбирает стратегию retrieval: формирование запроса, ретривер, reranking. Сравниваем три режима: фиксированный пайплайн, адаптацию без истории, адаптацию с историей.
+НИР, ИТМО, 2026/27. В многоходовом диалоговом RAG роутер по запросу и истории диалога выбирает стратегию поиска: как сформировать запрос (переписывать ли его), какой ретривер использовать и нужен ли reranking. Сравниваются три режима: **фиксированный пайплайн**, **адаптация без учёта истории**, **адаптация с учётом истории** — по качеству поиска, качеству ответов и стоимости.
 
-Журнал исследования, методика и результаты: [docs/](docs/README.md).
+- **RQ1.** Есть ли смысл выбирать стратегию для каждого запроса? Сравниваем оракул с лучшей фиксированной стратегией.
+- **RQ2.** Помогает ли роутеру история диалога?
+- **RQ3.** Какой компромисс «качество / стоимость» дают адаптивные роутеры?
+
+Подробности: [журнал исследования](docs/journal.md) · [методика и определения](docs/methodology.md) · [результаты](docs/results/) · [сводка](docs/README.md).
+
+## Статус по плану
+
+| Этап | Статус |
+|---|---|
+| 2. Постановка, датасеты, метрики | ✅ MTRAG; ⏳ MTRAG-UN (загрузчик есть, прогонов нет) |
+| 3. Бейзлайны и экспериментальная среда | ✅ BM25, dense, hybrid + reranker, LLM query rewriting, CHIQ, Adaptive-RAG; LLM лаборатории; Recall/nDCG, latency, токены; LLM-as-a-Judge с калибровкой на оценках людей |
+| 4. Роутер и сравнение трёх режимов | ✅ rule-based и LLM-based роутеры; сравнение по поиску, ответам и стоимости |
+| 5. Отчётные материалы | ⏳ презентация |
+
+## Главные результаты (MTRAG)
+
+Срез — последующие ходы диалога (n = 675), где история влияет на запрос. Метрики: nDCG@5 поиска и correctness ответа (LLM-судья, шкала 1–5). LLM-токены системы — переписывание запроса, роутер и генерация ответа.
+
+| режим | система | nDCG@5 | correctness | LLM-токены системы |
+|---|---|---|---|---|
+| фиксированный | `last:bm25` | 0.176 | — | — |
+| фиксированный | `last:dense` | 0.307 | 3.22 | 1726 |
+| фиксированный (из плана) | `last:hybrid+rerank` | 0.351 | 3.27 | 1710 |
+| фиксированный, бейзлайн CHIQ | `chiq:dense+rerank` | 0.405 | 3.51 | 3948 |
+| **фиксированный, лучший** | `llm_rewrite:dense+rerank` | **0.416** | **3.53** | 2176 |
+| без истории | `llm_nohist` (LLM-роутер) | 0.313 | 3.19 | 1912 |
+| без истории | `adaptive_rag` (бейзлайн Adaptive-RAG) | 0.394 | 3.44 | 1896 |
+| с историей | `llm_hist` (LLM-роутер) | 0.352 | 3.33 | 2581 |
+| с историей | `rule` (правила) | 0.393 | 3.49 | 1997 |
+| верхняя граница | `oracle` | 0.619 | 3.69 | 1873 |
+
+- **Dense (`bge-m3`) намного сильнее BM25; reranker и переписывание запроса через LLM значимо помогают и складываются.** LLM-переписывание значимо лучше человеческого rewrite из MTRAG.
+- **CHIQ** с dense и reranker не лучше простого LLM-переписывания, а стоит в 5 раз больше токенов на этапе поиска. Зато он сильно помогает BM25 и hybrid за счёт расширения запроса и выигрывает при смене темы.
+- **RQ1: запас для адаптации большой.** Оракул даёт 0.619 против 0.416 по nDCG@5. При этом LLM-переписывание нужно ему только в ~25% запросов, а reranker — в ~32%.
+- **RQ3:** `rule` и `adaptive_rag` по качеству ответов статистически неотличимы от лучшего фиксированного пайплайна, но дешевле на 8% и 13% LLM-токенов системы. `adaptive_rag` к тому же вызывает reranker только в 59% случаев.
+- **LLM-роутеры проигрывают.** Решение «переписывать ли» LLM принимает хорошо, а ретривер и reranker выбирает плохо. Вызов LLM-роутера с историей (623 токена) дороже самого переписывания (428).
+- **RQ2:** история нужна для самого переписывания. Но решение «на каком уровне обрабатывать вопрос» обученный классификатор без истории (`adaptive_rag`) принимает не хуже роутеров с историей.
+- **Улучшения поиска переходят в качество ответов** (ранговая корреляция систем ρ = 0.97), но разрыв на ответах в разы меньше: узкое место смещается в генерацию.
+- **Судья `qwen3.8`** согласуется с оценками людей на уровне ρ ≈ 0.40–0.63 (477 ответов MTRAG). Это не хуже автоматических метрик авторов MTRAG.
 
 ## Установка
 
 ```bash
-pip install -e ".[neural,dev]"     # без [neural] работает только BM25
-./scripts/download_data.sh         # MTRAG + MTRAG-UN в data/mt-rag-benchmark
-cp .env.example .env && source .env
+python3.10 -m venv venv && source venv/bin/activate
+pip install -e ".[neural,dev]"     # [neural] — torch и sentence-transformers для локального reranker
+./scripts/download_data.sh         # MTRAG + MTRAG-UN в data/mt-rag-benchmark (~530 МБ)
+cp .env.example .env               # вписать LLM_BASE_URL и LLM_API_KEY
+source .env
+arag llm-check                     # API, модели, эмбеддинги bge-m3
+arag rerank-check                  # локальный reranker и его скорость
+pytest -q
 ```
 
-Модели лаборатории подключаются через LiteLLM (OpenAI-совместимый API): `LLM_BASE_URL`, `LLM_API_KEY` в `.env`. Имена моделей и параметры (таймаут, повторы, `workers`, отключение thinking) в `config.yaml`. Проверка: `arag llm-check`.
+Модели лаборатории подключаются через LiteLLM (OpenAI-совместимый API). Имена моделей и параметры (таймаут, повторы, `workers`, отключение thinking у Qwen) задаются в [config.yaml](config.yaml).
+
+| роль | модель | где работает |
+|---|---|---|
+| переписывание запроса, CHIQ, LLM-роутеры, судья | `qwen3.8` | API |
+| генерация ответа | `gemma-4-26B-A4B-it` | API |
+| dense-эмбеддинги | `bge-m3` | API (`/v1/embeddings`) |
+| reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` | локально (`mps` / `cpu`) |
 
 ## Данные
 
@@ -21,86 +72,104 @@ cp .env.example .env && source .env
 | `mtrag` (MTRAG human) | 842 | 777 | clapnq, cloud, fiqa, govt |
 | `mtragun` (MTRAG-UN) | 507 | 332 | те же; Banking и Telco ещё не опубликованы |
 
-Корпуса passage-level (512 токенов, overlap 100), id совпадают с qrels. Задача хранит всю историю (`turns`), human-rewrite (`gold_rewrite`) и метки: answerability, multi_turn, question_type, эталонный ответ.
+Корпуса passage-level (512 токенов, overlap 100, 366 тыс. пассажей), id совпадают с qrels. Задача хранит всю историю (`turns`), human rewrite (`gold_rewrite`), эталонный ответ и метки: answerability, multi-turn, тип вопроса.
 
-## Стратегия
+## Стратегии и роутеры
 
-Строка вида `<query>:<retriever>[+rerank]`:
+**Стратегия** — строка `<query>:<retriever>[+rerank]`, всего 30 (`all`).
 
-- query: `last` · `user_concat` (последние 3 реплики пользователя) · `gold_rewrite` (human rewrite) · `llm_rewrite` (1 вызов LLM) · `chiq` (CHIQ-AD: улучшение истории + rewrite, 5–6 вызовов)
-- retriever: `bm25` · `dense` (`bge-m3` через `/v1/embeddings` сервера; `dense.backend: local` — sentence-transformers) · `hybrid` (RRF)
-- `+rerank`: локальный cross-encoder по top-50 (`reranker.model` в `config.yaml`, проверка: `arag rerank-check`)
+| часть | варианты |
+|---|---|
+| query | `last` — последний вопрос · `user_concat` — 3 последние реплики пользователя · `gold_rewrite` — human rewrite (на инференсе недоступен) · `llm_rewrite` — переписывание LLM, 1 вызов · `chiq` — CHIQ-AD, 5–6 вызовов |
+| retriever | `bm25` · `dense` (`bge-m3`) · `hybrid` (RRF) |
+| `+rerank` | cross-encoder по top-50 кандидатам |
 
-Всего 30 стратегий (`all`), из них 18 без LLM (`no_llm`) и 15 без reranker (`no_rerank`). Reranker пока требует локальный cross-encoder (`[neural]`), на сервере его нет.
+Группы для `--strategies`: `all` (30), `no_llm` (18), `no_rerank` (15).
+
+**Роутеры** (`arag route --router ...`) выбирают стратегию для каждой задачи:
+
+| роутер | что видит | что решает |
+|---|---|---|
+| `fixed --fixed <стратегия>` | — | одна стратегия для всех |
+| `rule` | вопрос, есть ли история | переписывать только зависимые от контекста вопросы; всегда dense + reranker (`config.yaml` → `routers.rule`) |
+| `llm_nohist` | только вопрос | ретривер и reranker |
+| `llm_hist` | вопрос и историю | переписывание, ретривер и reranker |
+| `adaptive_rag` | только вопрос | уровень сложности A / B / C → `last:dense` / `last:dense+rerank` / `llm_rewrite:dense+rerank`; классификатор на эмбеддингах, кросс-валидация по диалогам |
+| `oracle`, `oracle_cheap` | разметку оракула | лучшая / самая дешёвая из почти лучших стратегий (верхняя граница) |
+
+## Полный прогон
+
+```bash
+caffeinate -i arag index                                  # dense-индексы через API (~12 мин, с докачкой)
+caffeinate -i arag run --strategies all                   # 30 стратегий; готовые пропускаются
+arag eval --slice later_turns                             # Recall/nDCG, latency, токены по стратегиям
+arag oracle                                               # оракул и разметка
+arag analyze --out docs/results/mtrag_analysis.md         # отчёт по срезам
+arag significance --baseline last:dense --slice later_turns
+
+for r in rule llm_nohist llm_hist adaptive_rag oracle oracle_cheap; do arag route --router $r; done
+arag route --router fixed --fixed llm_rewrite:dense+rerank
+arag routes-summary --slice later_turns                   # роутеры: качество, решения, стоимость
+
+arag judge-calibrate --out docs/results/judge_calibration.md   # согласие судьи с оценками людей
+arag answer --run "runs/mtrag/llm_rewrite__dense+rerank.jsonl" runs/mtrag_routes/rule.jsonl   # ответы + судья
+arag answers-summary --slice later_turns --baseline "llm_rewrite:dense+rerank"
+```
+
+Все команды принимают `--dataset mtrag|mtragun`, `--domains`, `--limit`. Команды с LLM дополнительно принимают `--workers`.
 
 ## Команды
 
-```bash
-arag index                                            # dense-индексы корпусов через API (один раз, с докачкой)
-arag run --strategies no_rerank                       # 12 стратегий: 4 запроса × bm25/dense/hybrid
-arag run --strategies no_llm                          # бейзлайны без LLM
-arag run --strategies llm_rewrite:hybrid+rerank       # с LLM-rewrite
-arag run --dataset mtragun --strategies all
+| команда | что делает | куда пишет |
+|---|---|---|
+| `llm-check` | проверка API, моделей, эмбеддингов | — |
+| `rerank-check` | проверка reranker, замер скорости | — |
+| `index` | dense-индексы корпусов через API | `cache/index/<домен>/` |
+| `run` | прогон стратегий | `runs/<ds>/<стратегия>.jsonl` |
+| `eval` | метрики по стратегиям, срезы и домены | терминал, `runs/<ds>_summary.csv` |
+| `oracle` | оракул: реализуемый, cost-aware (`--eps`), с gold | `runs/<ds>_oracle.jsonl` |
+| `analyze` | отчёт: датасет, срезы, оракул, когда помогает rewrite | `--out` |
+| `significance` | парный bootstrap, рандомизационный тест, поправка Холма | терминал |
+| `route` | роутер поверх готовых прогонов | `runs/<ds>_routes/<роутер>.jsonl` |
+| `routes-summary` | сводка роутеров: качество, решения, стоимость | терминал, CSV |
+| `judge-calibrate` | судья на 477 ответах MTRAG с оценками людей | `--out` (.md + .jsonl) |
+| `answer` | генерация ответа и оценка судьёй (`--sample` — одна выборка для всех систем) | `runs/<ds>_answers/` |
+| `answers-summary` | таблица качества ответов и значимость (`--baseline`) | терминал, CSV |
 
-arag eval --slice later_turns                         # таблица метрик, срезы all / first_turn / later_turns
-arag eval --by-domain
-
-arag oracle --eps 0.05                                # лучшая стратегия на каждый запрос → разметка для роутера
-arag analyze --out docs/results/mtrag_analysis.md          # отчёт: датасет, срезы, оракул, когда помогает rewrite
-arag significance --baseline last:bm25 --slice later_turns   # парный bootstrap + рандомизационный тест, поправка Холма
-
-arag route --router fixed --fixed last:hybrid+rerank  # фиксированный пайплайн
-arag route --router llm_nohist                        # адаптация без истории (Adaptive-RAG-like)
-arag route --router llm_hist                          # адаптация с историей
-arag route --router rule
-
-arag judge-calibrate                                  # согласие LLM-судьи с human-оценками MTRAG
-arag answer --run runs/mtrag/last__dense.jsonl runs/mtrag_routes/rule.jsonl   # генерация + LLM-as-a-Judge
-arag answers-summary --baseline last:dense            # таблица качества ответов и значимость
-```
-
-`oracle` считает три варианта: реализуемый (без `gold_rewrite`, это и есть разметка `best`), cost-aware (самая дешёвая стратегия в пределах `eps` от лучшей, `best_cheap`) и с `gold_rewrite` как верхнюю границу (`best_with_gold`).
-
-`significance` сравнивает с baseline все runs из `runs/<dataset>/` и роутеры из `runs/<dataset>_routes/` (имя `route/<router>`).
-
-`route` берёт результаты из уже посчитанных runs, если стратегия там есть; иначе выполняет её на лету. Поэтому сначала стоит прогнать `run --strategies all`, тогда сравнение роутеров почти бесплатно.
-
-Флаг `--limit` пишет усечённый run-файл. Для полного прогона перезапустить с `--overwrite`.
-
-LLM-вызовы кэшируются в `cache/llm_cache.sqlite`. Latency при попадании в кэш берётся из первого вызова. Запросы к API идут параллельно (`--workers`, по умолчанию 8); упавший прогон при перезапуске продолжается с кэша. Для честных замеров latency LLM-этапов запускать с `--workers 1`.
+**Кэш.** Ответы LLM, эмбеддинги запросов и оценки пар reranker кэшируются в `cache/`. Упавший или прерванный прогон при перезапуске продолжается с места остановки. Latency при попадании в кэш берётся из первого вызова. Для честных замеров latency LLM-этапов запускать с `--workers 1`. `--limit` пишет усечённый run-файл; для полного прогона перезапустить с `--overwrite`.
 
 ## Метрики
 
-- Retrieval: Recall@{1,3,5,10}, nDCG@{1,3,5,10} (pytrec_eval, как в официальном скрипте MTRAG)
-- Стоимость: latency по этапам (rewrite, retrieve, rerank, router), LLM-токены, число пар для reranker
-- Ответы: correctness, faithfulness, completeness (1–5); генератор `llm.generator_model`, судья `llm.judge_model`, калибровка на human-оценках MTRAG
+- **Поиск:** Recall@{1,3,5,10}, nDCG@{1,3,5,10} (pytrec_eval, как в официальном скрипте MTRAG). Основная — nDCG@5.
+- **Стоимость:** LLM-токены, число пар reranker, latency по этапам (переписывание, эмбеддинг запроса, поиск, rerank, роутер).
+- **Ответы:** correctness, faithfulness, completeness (1–5) от LLM-судьи. Калибровка — на human-оценках MTRAG.
+- **Значимость:** парный bootstrap (95% ДИ) и рандомизационный тест с поправкой Холма.
 
-## Бейзлайны из обсуждения
+## Ограничения
 
-| Бейзлайн | Как получить |
-|---|---|
-| BM25, dense | `last:bm25`, `last:dense` |
-| Fixed Hybrid RAG + Reranker | `last:hybrid+rerank`, `llm_rewrite:hybrid+rerank` |
-| Query rewriting по истории | `llm_rewrite:*`; `gold_rewrite:*` как потолок |
-| CHIQ | TODO: отдельный `query mode` с history enhancement |
-| SemEval-2026 Task 8 | TODO: разобрать решения участников |
-| Adaptive-RAG | `route --router llm_nohist`; TODO: обучаемый классификатор сложности |
+- **Reranker — лёгкая MiniLM:** на M1 Air 8 ГБ `bge-reranker-v2-m3` слишком медленный. Latency reranker на ноутбуке нестабильна (троттлинг), поэтому стоимость сравниваем по токенам и числу пар.
+- **Ответы агента в истории MTRAG — эталонные.** LLM-переписывание может частично выигрывать за счёт этого.
+- **Оцениваются только задачи с qrels**; неотвечаемые вопросы не оцениваются.
+- **CHIQ:** реализован только ad-hoc вариант (CHIQ-AD). **Adaptive-RAG:** классификатор — логистическая регрессия на эмбеддингах вместо T5-large. Отличия от оригиналов — в [методике](docs/methodology.md).
+- **Правила `rule` выведены из анализа тех же данных MTRAG.** Проверка на отложенных данных — MTRAG-UN.
 
-## Первые результаты (BM25, MTRAG, fiqa + govt, later turns, n=332)
+## Структура репозитория
 
-| Стратегия | R@5 | R@10 | nDCG@5 | nDCG@10 |
-|---|---|---|---|---|
-| gold_rewrite:bm25 | 0.225 | 0.317 | 0.196 | 0.236 |
-| last:bm25 | 0.185 | 0.247 | 0.171 | 0.197 |
-| user_concat:bm25 | 0.174 | 0.249 | 0.156 | 0.188 |
+```
+src/arag/
+  cli.py          команды arag
+  data.py         загрузка задач, корпусов, qrels
+  queries.py      формирование запроса: last, user_concat, gold_rewrite, llm_rewrite, chiq
+  retrievers.py   BM25, dense (локальный и через API), RRF, reranker с кэшем пар
+  pipeline.py     стратегия = запрос + ретривер + rerank; Engine выполняет её на задаче
+  routers.py      fixed, rule, llm_nohist, llm_hist, adaptive_rag, oracle
+  generation.py   генерация ответа и LLM-судья
+  judging.py      калибровка судьи, сводка качества ответов
+  llm.py          OpenAI-совместимый клиент: кэш, повторы, параллельность, эмбеддинги
+  metrics.py, stats.py, analysis.py   метрики, тесты значимости, отчёты
+docs/             журнал, методика, отчёты с результатами
+tests/            юнит-тесты на фейковых LLM и моделях
+config.yaml       модели, параметры поиска, роутеров, API
+```
 
-Оракул по трём BM25-стратегиям: nDCG@5 0.293 против 0.216 у лучшей фиксированной. Запас для роутера есть уже на уровне формирования запроса.
-
-## TODO
-
-- [ ] Dense и reranker на GPU, все 24 стратегии на 4 доменах
-- [ ] Подключить Qwen / gemma, прогнать `llm_rewrite`
-- [ ] CHIQ, решения SemEval-2026 Task 8
-- [ ] Обучаемый роутер на разметке оракула (cost-aware)
-- [ ] Калибровка судьи на `reference_subset_with_human_evaluations.json`
-- [ ] Pareto «качество vs стоимость»
+`data/`, `runs/`, `cache/` в git не попадают. Результаты, которые нужно сохранить, лежат в `docs/results/` и в журнале; логи терминала — в `runs/logs/`.
