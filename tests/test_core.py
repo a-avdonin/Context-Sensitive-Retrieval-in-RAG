@@ -48,10 +48,27 @@ def test_query_modes():
 
 def test_rule_router():
     r = RuleRouter()
-    assert r.route(task("What is the capital gains tax rate in the US?")).strategy == r.cheap
-    assert r.route(task("What is NAV?", "How is it calculated?")).strategy == r.contextual
-    assert r.route(task("What is NAV?", "enterprise value")).strategy == r.hard
-    assert r.route(task("What is NAV?", "What does the SEC require for mutual fund NAV reporting?")).strategy == r.cheap
+    assert r.route(task("What is the capital gains tax rate in the US?")).strategy == r.first_turn
+    assert r.route(task("What is NAV?", "How is it calculated?")).strategy == r.dependent
+    assert r.route(task("What is NAV?", "enterprise value")).strategy == r.dependent
+    assert r.route(task("What is NAV?", "What does the SEC require for mutual fund NAV reporting?")).strategy \
+        == r.standalone
+    custom = RuleRouter(first_turn="last:bm25", standalone="last:dense", dependent="llm_rewrite:dense")
+    assert custom.route(task("What is NAV?", "How is it calculated?")).strategy == "llm_rewrite:dense"
+
+
+def test_oracle_router(tmp_path):
+    import json
+
+    from arag.routers import OracleRouter
+
+    p = tmp_path / "o.jsonl"
+    p.write_text(json.dumps({"task_id": "c<::>1", "best": "llm_rewrite:dense+rerank", "best_cheap": "last:dense"}))
+    t = task("What is NAV?", "How is it calculated?")
+    assert OracleRouter(p).route(t).strategy == "llm_rewrite:dense+rerank"
+    assert OracleRouter(p, "best_cheap").route(t).strategy == "last:dense"
+    t.task_id = "other"
+    assert OracleRouter(p).route(t).rationale == "no_label"
 
 
 def test_llm_router_history_and_fallback():
@@ -200,3 +217,82 @@ def test_engine_dense_api_latency(tmp_path):
     rec = eng.run(task("What is NAV fund?"), "last:dense")
     assert rec.latency_ms["embed"] == 12.5 and len(rec.hits) == 2
     assert {h[0] for h in rec.hits} <= {"a", "b", "c"}
+
+
+class FakeCrossEncoder:
+    """Оценка = число общих слов запроса и пассажа."""
+
+    def __init__(self):
+        self.pairs = 0
+
+    def predict(self, pairs, batch_size=32, show_progress_bar=False):
+        self.pairs += len(pairs)
+        return [len(set(q.lower().split()) & set(p.lower().split())) for q, p in pairs]
+
+
+def test_reranker_cache_and_latency(tmp_path):
+    from arag.retrievers import Reranker
+
+    corpus = {"a": "kubernetes pod", "b": "net asset value of a fund", "c": "fund nav value"}
+    fake = FakeCrossEncoder()
+    rr = Reranker("m", cache_path=tmp_path / "rr.sqlite", model=fake)
+    hits = rr.rerank("nav value fund", [("a", 1.0), ("b", 0.9), ("c", 0.8)], corpus, 2)
+    assert [h[0] for h in hits] == ["c", "b"] and fake.pairs == 3 and rr.last_computed == 3
+    lat = rr.last_latency_ms
+    # повтор и частично пересекающийся набор кандидатов: считаются только новые пары
+    rr.rerank("nav value fund", [("c", 0), ("a", 0)], corpus, 2)
+    assert fake.pairs == 3 and rr.last_computed == 0 and rr.last_latency_ms > 0
+    corpus["d"] = "nav"
+    rr.rerank("nav value fund", [("c", 0), ("d", 0)], corpus, 2)
+    assert fake.pairs == 4 and rr.last_computed == 1
+    # кэш переживает перезапуск; другая модель — другие ключи
+    rr2 = Reranker("m", cache_path=tmp_path / "rr.sqlite", model=FakeCrossEncoder())
+    rr2.rerank("nav value fund", [("a", 0), ("b", 0), ("c", 0)], corpus, 3)
+    assert rr2.model.pairs == 0 and abs(rr2.last_latency_ms - lat) < 1e-6
+    rr3 = Reranker("other", cache_path=tmp_path / "rr.sqlite", model=FakeCrossEncoder())
+    rr3.rerank("nav value fund", [("a", 0)], corpus, 1)
+    assert rr3.model.pairs == 1
+
+
+def test_engine_rerank_records_model(tmp_path):
+    from arag.pipeline import Engine
+    from arag.retrievers import Reranker
+
+    cfg = {"cache_dir": str(tmp_path), "data_dir": "", "retrieval": {"top_k": 2, "first_stage_k": 5, "rrf_k": 60},
+           "dense": {"backend": "api", "model": "m", "batch_size": 4, "workers": 1},
+           "reranker": {"model": "fake-ce", "candidates": 3},
+           "llm": {"rewrite_model": "m", "max_history_turns": 6}}
+    eng = Engine(cfg, FakeEmbedLLM())
+    eng.corpus = lambda d: {"a": "net asset value fund", "b": "kubernetes pod", "c": "fund nav", "d": "x y"}
+    eng._reranker = Reranker("fake-ce", model=FakeCrossEncoder())
+    rec = eng.run(task("What is NAV fund?"), "last:dense+rerank")
+    assert rec.reranker == "fake-ce" and rec.rerank_pairs == 3 and "rerank" in rec.latency_ms
+    assert eng.run(task("What is NAV fund?"), "last:dense").reranker == ""
+
+
+def test_routes_summary(tmp_path, monkeypatch, capsys):
+    import json
+    from types import SimpleNamespace
+
+    import arag.cli as cli
+
+    t1, t2 = task("What is NAV?"), task("What is NAV?", "How is it calculated?")
+    t1.task_id, t2.task_id = "c<::>1", "c<::>2"
+    qrels = {"c<::>1": {"a": 1}, "c<::>2": {"b": 1}}
+    monkeypatch.setattr(cli, "_tasks", lambda cfg, args: ([t1, t2], qrels))
+    d = tmp_path / "mtrag_routes"
+    d.mkdir()
+    lat = {"total": 100.0, "router": 10.0}
+    recs = [{"task_id": "c<::>1", "route": "last:dense+rerank", "hits": [["a", 1.0]], "latency_ms": lat,
+             "prompt_tokens": 50, "completion_tokens": 5, "rerank_pairs": 50, "rationale": "x"},
+            {"task_id": "c<::>2", "route": "llm_rewrite:dense", "hits": [["x", 1.0]], "latency_ms": lat,
+             "prompt_tokens": 450, "completion_tokens": 15, "rerank_pairs": 0, "rationale": "parse_error"}]
+    (d / "rule.jsonl").write_text("\n".join(json.dumps(r) for r in recs))
+    cfg = {"runs_dir": str(tmp_path), "eval": {"k_values": [1, 3, 5, 10]}}
+    cli.cmd_routes_summary(cfg, SimpleNamespace(dataset="mtrag", slice="all"))
+    out = capsys.readouterr().out
+    row = next(l for l in out.splitlines() if l.startswith("rule"))
+    cells = row.split("\t")
+    assert cells[2] == "0.5000"            # nDCG@5: один запрос найден, другой нет
+    assert cells[4] == "1.0000"            # rewrite_rate среди later-задач
+    assert cells[5] == "0.5000" and cells[-1] == "1"
