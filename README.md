@@ -2,6 +2,8 @@
 
 НИР, ИТМО, 2026/27. Роутер анализирует запрос и историю диалога и выбирает стратегию retrieval: формирование запроса, ретривер, reranking. Сравниваем три режима: фиксированный пайплайн, адаптацию без истории, адаптацию с историей.
 
+Журнал исследования, методика и результаты: [docs/](docs/README.md).
+
 ## Установка
 
 ```bash
@@ -41,7 +43,9 @@ arag run --dataset mtragun --strategies all
 arag eval --slice later_turns                         # таблица метрик, срезы all / first_turn / later_turns
 arag eval --by-domain
 
-arag oracle                                           # лучшая стратегия на каждый запрос → разметка для роутера
+arag oracle --eps 0.05                                # лучшая стратегия на каждый запрос → разметка для роутера
+arag analyze --out docs/results/mtrag_analysis.md          # отчёт: датасет, срезы, оракул, когда помогает rewrite
+arag significance --baseline last:bm25 --slice later_turns   # парный bootstrap + рандомизационный тест, поправка Холма
 
 arag route --router fixed --fixed last:hybrid+rerank  # фиксированный пайплайн
 arag route --router llm_nohist                        # адаптация без истории (Adaptive-RAG-like)
@@ -50,6 +54,10 @@ arag route --router rule
 
 arag answer --run runs/mtrag/llm_rewrite__hybrid+rerank.jsonl --limit 100   # генерация + LLM-as-a-Judge
 ```
+
+`oracle` считает три варианта: реализуемый (без `gold_rewrite`, это и есть разметка `best`), cost-aware (самая дешёвая стратегия в пределах `eps` от лучшей, `best_cheap`) и с `gold_rewrite` как верхнюю границу (`best_with_gold`).
+
+`significance` сравнивает с baseline все runs из `runs/<dataset>/` и роутеры из `runs/<dataset>_routes/` (имя `route/<router>`).
 
 `route` берёт результаты из уже посчитанных runs, если стратегия там есть; иначе выполняет её на лету. Поэтому сначала стоит прогнать `run --strategies all`, тогда сравнение роутеров почти бесплатно.
 
