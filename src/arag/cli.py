@@ -266,7 +266,7 @@ def cmd_route(cfg, args):
     tasks, qrels = _tasks(cfg, args)
     runs = {s: {r["task_id"]: r for r in recs} for s, recs in _load_runs(cfg, args.dataset).items()}
     llm = _llm(cfg) if args.router.startswith("llm") else None
-    router = build_router(args.router, cfg, llm, args.fixed)
+    router = build_router(args.router, cfg, llm, args.fixed, args.dataset)
     engine = None
     out = []
     # решения роутера считаем параллельно; ошибка API после всех повторов роняет прогон,
@@ -300,6 +300,50 @@ def cmd_route(cfg, args):
     for r in out:
         dist[r["route"]] += 1
     print("\nroutes:", dict(sorted(dist.items(), key=lambda x: -x[1])))
+
+
+def cmd_routes_summary(cfg, args):
+    """Сводная таблица по всем роутерам из runs/<dataset>_routes/: качество, решения и стоимость."""
+    tasks, qrels = _tasks(cfg, args)
+    slices, by = _slices(tasks)
+    keep = slices[args.slice]
+    rows = []
+    for p in sorted((Path(cfg["runs_dir"]) / f"{args.dataset}_routes").glob("*.jsonl")):
+        recs = [r for r in read_jsonl(p) if r["task_id"] in by and keep(r["task_id"])]
+        if not recs:
+            continue
+        scores = per_query(qrels, records_to_run(recs), cfg["eval"]["k_values"])
+        n = len(recs)
+        st = [Strategy.parse(r["route"]) for r in recs]
+        later = [s for s, r in zip(st, recs) if by[r["task_id"]].history]
+        row = {"router": p.stem, "n": n} | {k: v for k, v in aggregate(scores).items()
+                                             if k in ("ndcg_cut_5", "ndcg_cut_10", "recall_5", "recall_10")}
+        row |= {
+            # rewrite на первом ходе — пустая операция (LLM не вызывается), поэтому считаем долю среди later
+            "rewrite_rate": sum(s.query == "llm_rewrite" for s in later) / max(len(later), 1),
+            "rerank_rate": sum(s.rerank for s in st) / n,
+            "dense_rate": sum(s.retriever == "dense" for s in st) / n,
+            "hybrid_rate": sum(s.retriever == "hybrid" for s in st) / n,
+            "bm25_rate": sum(s.retriever == "bm25" for s in st) / n,
+            "llm_tokens": sum(r["prompt_tokens"] + r["completion_tokens"] for r in recs) / n,
+            "router_ms": sum(r["latency_ms"].get("router", 0) for r in recs) / n,
+            "latency_ms": sum(r["latency_ms"]["total"] for r in recs) / n,
+            "rerank_pairs": sum(r.get("rerank_pairs", 0) for r in recs) / n,
+            "parse_errors": sum(r.get("rationale") == "parse_error" for r in recs),
+        }
+        rows.append(row)
+    if not rows:
+        raise SystemExit("нет файлов в runs/<dataset>_routes — сначала `arag route ...`")
+    cols = ["router", "n", "ndcg_cut_5", "recall_10", "rewrite_rate", "rerank_rate", "dense_rate", "hybrid_rate",
+            "bm25_rate", "llm_tokens", "rerank_pairs", "router_ms", "latency_ms", "parse_errors"]
+    print(f"slice={args.slice}\n")
+    _print_table(sorted(rows, key=lambda r: -r["ndcg_cut_5"]), cols)
+    out = Path(cfg["runs_dir"]) / f"{args.dataset}_routes_summary_{args.slice}.csv"
+    with open(out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nsaved {out}")
 
 
 def cmd_answer(cfg, args):
@@ -538,8 +582,13 @@ def main():
 
     sp = sub.add_parser("route", help="оценить роутер")
     common(sp)
-    sp.add_argument("--router", default="rule", choices=["fixed", "rule", "llm_nohist", "llm_hist"])
+    sp.add_argument("--router", default="rule",
+                    choices=["fixed", "rule", "llm_nohist", "llm_hist", "oracle", "oracle_cheap"])
     sp.add_argument("--fixed", default="last:hybrid+rerank")
+
+    sp = sub.add_parser("routes-summary", help="сводная таблица роутеров: качество, решения, стоимость")
+    common(sp)
+    sp.add_argument("--slice", default="all", choices=["all", "first_turn", "later_turns"])
 
     sp = sub.add_parser("answer", help="генерация ответа и LLM-as-a-Judge по файлу run")
     common(sp)
@@ -550,7 +599,8 @@ def main():
     cfg = load_config(args.config)
     cmds = {"run": cmd_run, "eval": cmd_eval, "oracle": cmd_oracle, "analyze": cmd_analyze,
             "significance": cmd_significance, "route": cmd_route, "answer": cmd_answer, "llm-check": cmd_llm_check,
-            "index": cmd_index, "rerank-check": cmd_rerank_check}
+            "index": cmd_index, "rerank-check": cmd_rerank_check,
+            "routes-summary": cmd_routes_summary}
     cmds[args.cmd](cfg, args)
 
 

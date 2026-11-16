@@ -48,10 +48,27 @@ def test_query_modes():
 
 def test_rule_router():
     r = RuleRouter()
-    assert r.route(task("What is the capital gains tax rate in the US?")).strategy == r.cheap
-    assert r.route(task("What is NAV?", "How is it calculated?")).strategy == r.contextual
-    assert r.route(task("What is NAV?", "enterprise value")).strategy == r.hard
-    assert r.route(task("What is NAV?", "What does the SEC require for mutual fund NAV reporting?")).strategy == r.cheap
+    assert r.route(task("What is the capital gains tax rate in the US?")).strategy == r.first_turn
+    assert r.route(task("What is NAV?", "How is it calculated?")).strategy == r.dependent
+    assert r.route(task("What is NAV?", "enterprise value")).strategy == r.dependent
+    assert r.route(task("What is NAV?", "What does the SEC require for mutual fund NAV reporting?")).strategy \
+        == r.standalone
+    custom = RuleRouter(first_turn="last:bm25", standalone="last:dense", dependent="llm_rewrite:dense")
+    assert custom.route(task("What is NAV?", "How is it calculated?")).strategy == "llm_rewrite:dense"
+
+
+def test_oracle_router(tmp_path):
+    import json
+
+    from arag.routers import OracleRouter
+
+    p = tmp_path / "o.jsonl"
+    p.write_text(json.dumps({"task_id": "c<::>1", "best": "llm_rewrite:dense+rerank", "best_cheap": "last:dense"}))
+    t = task("What is NAV?", "How is it calculated?")
+    assert OracleRouter(p).route(t).strategy == "llm_rewrite:dense+rerank"
+    assert OracleRouter(p, "best_cheap").route(t).strategy == "last:dense"
+    t.task_id = "other"
+    assert OracleRouter(p).route(t).rationale == "no_label"
 
 
 def test_llm_router_history_and_fallback():
@@ -251,3 +268,31 @@ def test_engine_rerank_records_model(tmp_path):
     rec = eng.run(task("What is NAV fund?"), "last:dense+rerank")
     assert rec.reranker == "fake-ce" and rec.rerank_pairs == 3 and "rerank" in rec.latency_ms
     assert eng.run(task("What is NAV fund?"), "last:dense").reranker == ""
+
+
+def test_routes_summary(tmp_path, monkeypatch, capsys):
+    import json
+    from types import SimpleNamespace
+
+    import arag.cli as cli
+
+    t1, t2 = task("What is NAV?"), task("What is NAV?", "How is it calculated?")
+    t1.task_id, t2.task_id = "c<::>1", "c<::>2"
+    qrels = {"c<::>1": {"a": 1}, "c<::>2": {"b": 1}}
+    monkeypatch.setattr(cli, "_tasks", lambda cfg, args: ([t1, t2], qrels))
+    d = tmp_path / "mtrag_routes"
+    d.mkdir()
+    lat = {"total": 100.0, "router": 10.0}
+    recs = [{"task_id": "c<::>1", "route": "last:dense+rerank", "hits": [["a", 1.0]], "latency_ms": lat,
+             "prompt_tokens": 50, "completion_tokens": 5, "rerank_pairs": 50, "rationale": "x"},
+            {"task_id": "c<::>2", "route": "llm_rewrite:dense", "hits": [["x", 1.0]], "latency_ms": lat,
+             "prompt_tokens": 450, "completion_tokens": 15, "rerank_pairs": 0, "rationale": "parse_error"}]
+    (d / "rule.jsonl").write_text("\n".join(json.dumps(r) for r in recs))
+    cfg = {"runs_dir": str(tmp_path), "eval": {"k_values": [1, 3, 5, 10]}}
+    cli.cmd_routes_summary(cfg, SimpleNamespace(dataset="mtrag", slice="all"))
+    out = capsys.readouterr().out
+    row = next(l for l in out.splitlines() if l.startswith("rule"))
+    cells = row.split("\t")
+    assert cells[2] == "0.5000"            # nDCG@5: один запрос найден, другой нет
+    assert cells[4] == "1.0000"            # rewrite_rate среди later-задач
+    assert cells[5] == "0.5000" and cells[-1] == "1"
