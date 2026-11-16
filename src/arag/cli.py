@@ -355,18 +355,27 @@ def cmd_routes_summary(cfg, args):
     print(f"\nsaved {out}")
 
 
+def _answers_dir(cfg, dataset) -> Path:
+    # отдельная папка: в runs/<ds>/ и runs/<ds>_routes/ лежат только run-файлы с hits
+    return Path(cfg["runs_dir"]) / f"{dataset}_answers"
+
+
 def cmd_answer(cfg, args):
+    """Генерация ответа по top-k пассажам и оценка судьёй для одного или нескольких run-/route-файлов."""
+    import random
+
     from .data import load_corpus
-    from .generation import generate, judge
+    from .generation import CRITERIA, generate, judge
 
     tasks, _ = _tasks(cfg, args)
+    if args.sample and args.sample < len(tasks):  # одна и та же выборка для всех систем
+        ids = set(random.Random(args.seed).sample(sorted(t.task_id for t in tasks), args.sample))
+        tasks = [t for t in tasks if t.task_id in ids]
     by = {t.task_id: t for t in tasks}
-    src = Path(args.run)
-    recs = [r for r in read_jsonl(src) if r["task_id"] in by]
     llm, c = _llm(cfg), cfg["llm"]
     if c["generator_model"] == c["judge_model"]:
         print(f"ВНИМАНИЕ: генератор и судья — одна модель ({c['judge_model']}), оценки будут завышены")
-    corpora = {d: load_corpus(cfg["data_dir"], d) for d in {by[r["task_id"]].domain for r in recs}}
+    corpora = {d: load_corpus(cfg["data_dir"], d) for d in {t.domain for t in tasks}}
 
     def one(r):
         t = by[r["task_id"]]
@@ -374,19 +383,96 @@ def cmd_answer(cfg, args):
         docs = [d for d, _ in r["hits"][: args.k]]
         answer, g = generate(llm, c["generator_model"], t, docs, corpus, c["max_history_turns"])
         scores, j = judge(llm, c["judge_model"], t, answer, docs, corpus, c["max_history_turns"])
-        return {"task_id": t.task_id, "answer": answer, "judge": scores,
+        return {"task_id": t.task_id, "answer": answer, "judge": scores, "docs": docs,
                 "gen_tokens": g.prompt_tokens + g.completion_tokens, "gen_latency_ms": g.latency_ms,
                 "judge_tokens": j.prompt_tokens + j.completion_tokens,
                 "answerability": t.meta["answerability"]}
 
-    out = parallel_map(one, recs, _workers(cfg, args), "answer+judge")
-    write_jsonl(src.with_name(src.stem + "_answers.jsonl"), out)
-    for crit in ("correctness", "faithfulness", "completeness"):
-        vals = [o["judge"].get(crit) for o in out if isinstance(o["judge"].get(crit), (int, float))]
-        print(f"{crit}: {sum(vals) / max(len(vals), 1):.3f} (n={len(vals)})")
-    bad = sum(not o["judge"] for o in out)
-    if bad:
-        print(f"судья не вернул разбираемый JSON в {bad} из {len(out)} случаев")
+    for run in args.run:
+        src = Path(run)
+        recs = [r for r in read_jsonl(src) if r["task_id"] in by]
+        if len(recs) < len(by):
+            print(f"{src.name}: в файле {len(recs)} из {len(by)} задач выборки")
+        name = ("route_" if src.parent.name.endswith("_routes") else "") + src.stem
+        # одинаковые (вопрос, top-k пассажей) у разных систем берутся из кэша LLM
+        out = parallel_map(one, recs, _workers(cfg, args), f"answer+judge {name}")
+        dst = _answers_dir(cfg, args.dataset) / f"{name}.jsonl"
+        write_jsonl(dst, out)
+        ok = [o for o in out if o["judge"]]
+        line = "  ".join(f"{crit}={sum(o['judge'][crit] for o in ok) / max(len(ok), 1):.3f}" for crit in CRITERIA)
+        print(f"{name}: {line}  (оценено {len(ok)} из {len(out)}) → {dst}")
+
+
+def cmd_answers_summary(cfg, args):
+    """Таблица качества ответов по всем системам из runs/<dataset>_answers/ (+ парные тесты против baseline)."""
+    import numpy as np
+
+    from .generation import CRITERIA
+    from .judging import answers_table
+    from .stats import holm, paired_bootstrap, randomization_test
+
+    tasks, _ = _tasks(cfg, args)
+    slices, by = _slices(tasks)
+    keep = lambda tid: tid in by and slices[args.slice](tid)  # noqa: E731
+    files = sorted(_answers_dir(cfg, args.dataset).glob("*.jsonl"))
+    rows, per_task = answers_table(files, keep)
+    if not rows:
+        raise SystemExit("нет файлов в runs/<dataset>_answers — сначала `arag answer --run ...`")
+    print(f"slice={args.slice}  (шкала судьи 1–5; declined — доля ответов-отказов)\n")
+    cols = ["system", "n", "judged", *CRITERIA, "declined", "gen_tokens", "judge_tokens"]
+    _print_table(sorted(rows, key=lambda r: -(r["correctness"] or 0)), cols)
+    out = Path(cfg["runs_dir"]) / f"{args.dataset}_answers_summary_{args.slice}.csv"
+    with open(out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nsaved {out}")
+
+    if args.baseline:
+        if args.baseline not in per_task:
+            raise SystemExit(f"нет ответов для {args.baseline}; есть: {', '.join(per_task)}")
+        base, cmp_rows = per_task[args.baseline], []
+        for s, sc in per_task.items():
+            common = sorted(set(base) & set(sc))
+            if s == args.baseline or not common:
+                continue
+            a = np.array([base[q][args.metric] for q in common], float)
+            b = np.array([sc[q][args.metric] for q in common], float)
+            delta, lo, hi = paired_bootstrap(a, b, args.n)
+            cmp_rows.append({"system": s, "n": len(common), "baseline": a.mean(), "system_score": b.mean(),
+                             "delta": delta, "ci_low": lo, "ci_high": hi, "p": randomization_test(a, b, args.n)})
+        for r, p in zip(cmp_rows, holm([r["p"] for r in cmp_rows])):
+            r["p_holm"] = p
+        print(f"\nbaseline={args.baseline}  metric={args.metric}\n")
+        _print_table(sorted(cmp_rows, key=lambda r: -r["delta"]),
+                     ["system", "n", "baseline", "system_score", "delta", "ci_low", "ci_high", "p", "p_holm"])
+
+
+def cmd_judge_calibrate(cfg, args):
+    """Судья оценивает ответы с human-оценками из MTRAG; считаем согласие с людьми."""
+    from .generation import judge_texts
+    from .judging import calibration_report, load_human_eval
+
+    items = load_human_eval(cfg["data_dir"])
+    if args.limit:
+        items = items[: args.limit]
+    llm, c = _llm(cfg), cfg["llm"]
+    model = args.model or c["judge_model"]
+
+    def one(i):
+        scores, _ = judge_texts(llm, model, i["turns"], i["reference"], i["answer"], i["passages"],
+                                c["max_history_turns"])
+        return i | {"judge": scores}
+
+    items = parallel_map(one, items, args.workers or c.get("workers", 8), f"judge-calibrate {model}")
+    report = calibration_report(items, model)
+    out = Path(args.out) if args.out else Path(cfg["runs_dir"]) / f"judge_calibration_{model.replace('/', '__')}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report)
+    write_jsonl(out.with_suffix(".jsonl"), [{k: i[k] for k in ("task_id", "model_id", "judge", "human", "official")}
+                                            for i in items])
+    print(report)
+    print(f"\nsaved {out}")
 
 
 def cmd_index(cfg, args):
@@ -599,17 +685,34 @@ def main():
     common(sp)
     sp.add_argument("--slice", default="all", choices=["all", "first_turn", "later_turns"])
 
-    sp = sub.add_parser("answer", help="генерация ответа и LLM-as-a-Judge по файлу run")
+    sp = sub.add_parser("answer", help="генерация ответа и LLM-as-a-Judge по run-/route-файлам")
     common(sp)
-    sp.add_argument("--run", required=True, help="путь к runs/<dataset>/<strategy>.jsonl")
-    sp.add_argument("--k", type=int, default=5)
+    sp.add_argument("--run", required=True, nargs="+",
+                    help="пути к runs/<dataset>/<strategy>.jsonl и/или runs/<dataset>_routes/<router>.jsonl")
+    sp.add_argument("--k", type=int, default=5, help="сколько пассажей давать генератору")
+    sp.add_argument("--sample", type=int, help="случайная подвыборка задач (одна и та же для всех систем)")
+    sp.add_argument("--seed", type=int, default=0)
+
+    sp = sub.add_parser("answers-summary", help="таблица качества ответов по системам")
+    common(sp)
+    sp.add_argument("--slice", default="all", choices=["all", "first_turn", "later_turns"])
+    sp.add_argument("--baseline", help="система для парных тестов: стратегия или route/<имя>")
+    sp.add_argument("--metric", default="correctness", choices=["correctness", "faithfulness", "completeness"])
+    sp.add_argument("--n", type=int, default=10000)
+
+    sp = sub.add_parser("judge-calibrate", help="согласие LLM-судьи с human-оценками MTRAG")
+    sp.add_argument("--model", help="модель судьи вместо llm.judge_model")
+    sp.add_argument("--limit", type=int)
+    sp.add_argument("--workers", type=int)
+    sp.add_argument("--out", help="путь к .md (по умолчанию runs/judge_calibration_<model>.md)")
 
     args = p.parse_args()
     cfg = load_config(args.config)
     cmds = {"run": cmd_run, "eval": cmd_eval, "oracle": cmd_oracle, "analyze": cmd_analyze,
             "significance": cmd_significance, "route": cmd_route, "answer": cmd_answer, "llm-check": cmd_llm_check,
             "index": cmd_index, "rerank-check": cmd_rerank_check,
-            "routes-summary": cmd_routes_summary}
+            "routes-summary": cmd_routes_summary, "answers-summary": cmd_answers_summary,
+            "judge-calibrate": cmd_judge_calibrate}
     cmds[args.cmd](cfg, args)
 
 

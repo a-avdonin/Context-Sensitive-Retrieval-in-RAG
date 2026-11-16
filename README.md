@@ -54,7 +54,9 @@ arag route --router llm_nohist                        # адаптация бе�
 arag route --router llm_hist                          # адаптация с историей
 arag route --router rule
 
-arag answer --run runs/mtrag/llm_rewrite__hybrid+rerank.jsonl --limit 100   # генерация + LLM-as-a-Judge
+arag judge-calibrate                                  # согласие LLM-судьи с human-оценками MTRAG
+arag answer --run runs/mtrag/last__dense.jsonl runs/mtrag_routes/rule.jsonl   # генерация + LLM-as-a-Judge
+arag answers-summary --baseline last:dense            # таблица качества ответов и значимость
 ```
 
 `oracle` считает три варианта: реализуемый (без `gold_rewrite`, это и есть разметка `best`), cost-aware (самая дешёвая стратегия в пределах `eps` от лучшей, `best_cheap`) и с `gold_rewrite` как верхнюю границу (`best_with_gold`).
@@ -71,7 +73,7 @@ LLM-вызовы кэшируются в `cache/llm_cache.sqlite`. Latency пр�
 
 - Retrieval: Recall@{1,3,5,10}, nDCG@{1,3,5,10} (pytrec_eval, как в официальном скрипте MTRAG)
 - Стоимость: latency по этапам (rewrite, retrieve, rerank, router), LLM-токены, число пар для reranker
-- Ответы: correctness, faithfulness, completeness (1–5), судья задаётся `llm.judge_model`
+- Ответы: correctness, faithfulness, completeness (1–5); генератор `llm.generator_model`, судья `llm.judge_model`, калибровка на human-оценках MTRAG
 
 ## Бейзлайны из обсуждения
 
