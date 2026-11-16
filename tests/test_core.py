@@ -25,7 +25,7 @@ def task(*user_turns):
 def test_strategy_roundtrip():
     for s in all_strategies():
         assert str(Strategy.parse(s)) == s
-    assert len(all_strategies()) == 24
+    assert len(all_strategies()) == 30  # 5 query modes × 3 retrievers × rerank
 
 
 def test_metrics():
@@ -296,3 +296,90 @@ def test_routes_summary(tmp_path, monkeypatch, capsys):
     assert cells[2] == "0.5000"            # nDCG@5: один запрос найден, другой нет
     assert cells[4] == "1.0000"            # rewrite_rate среди later-задач
     assert cells[5] == "0.5000" and cells[-1] == "1"
+
+
+class ChiqFakeLLM:
+    """Отвечает по типу шага CHIQ (узнаёт его по инструкции)."""
+
+    def __init__(self, switch=False, rewrite='{"query": "NAV vs market cap importance"}',
+                 pr="Market cap matters more for stocks."):
+        self.switch, self.rewrite, self.pr, self.calls = switch, rewrite, pr, []
+
+    def chat(self, model, messages, max_tokens=512, **kw):
+        p = messages[-1]["content"]
+        self.calls.append(p)
+        if "introduces a new topic" in p:
+            out = "new_topic" if self.switch else "old_topic"
+        elif "ambiguous" in p:
+            out = "Which is more important, NAV or market cap?"
+        elif "long version of the answer" in p:
+            out = "NAV is the per-share value of fund assets minus liabilities."
+        elif "one sentence response" in p:
+            out = self.pr
+        elif "summarizes the information" in p:
+            out = "The user asked about NAV and market cap."
+        else:
+            out = self.rewrite
+        return LLMResult(out, 10, 2, 5.0)
+
+
+def test_chiq_pipeline():
+    from arag.queries import qa_pairs
+
+    t = task("What is NAV?", "And market cap?", "Which one is more important?")
+    assert qa_pairs(t.history) == [("What is NAV?", "answer"), ("And market cap?", "answer")]
+    llm = ChiqFakeLLM()
+    q = QueryBuilder(llm, "m").build(t, "chiq")
+    assert q.info["calls"] == 6 and not q.info["topic_switch"]           # TS, QD, RE, PR, HS, rewrite
+    assert q.rerank_text == "NAV vs market cap importance"
+    assert q.text.startswith("NAV vs market cap importance Market cap matters")
+    assert q.text.endswith("Which is more important, NAV or market cap?")
+    assert q.prompt_tokens == 60 and q.latency_ms == 30.0
+    assert "### Context" in llm.calls[0] and "### Question" in llm.calls[0]
+    # смена темы: история урезается до последней пары, summary не вызывается
+    llm2 = ChiqFakeLLM(switch=True, rewrite="plain rewrite without json")
+    q2 = QueryBuilder(llm2, "m").build(t, "chiq")
+    assert q2.info["calls"] == 5 and q2.info["topic_switch"] and q2.rerank_text == "plain rewrite without json"
+    assert "What is NAV?" not in llm2.calls[-1]
+    # первый ход: без вызовов LLM
+    assert QueryBuilder(ChiqFakeLLM(), "m").build(task("What is NAV?"), "chiq").text == "What is NAV?"
+
+
+def test_engine_uses_rerank_text(tmp_path):
+    from arag.pipeline import Engine
+    from arag.retrievers import Reranker
+
+    seen = []
+
+    class SpyCE(FakeCrossEncoder):
+        def predict(self, pairs, **kw):
+            seen.extend(q for q, _ in pairs)
+            return super().predict(pairs, **kw)
+
+    cfg = {"cache_dir": str(tmp_path), "data_dir": "", "retrieval": {"top_k": 2, "first_stage_k": 5, "rrf_k": 60},
+           "dense": {"backend": "api", "model": "m", "batch_size": 4, "workers": 1},
+           "reranker": {"model": "ce", "candidates": 3}, "llm": {"rewrite_model": "m", "max_history_turns": 6}}
+
+    class Both(FakeEmbedLLM, ChiqFakeLLM):
+        def __init__(self):
+            FakeEmbedLLM.__init__(self)
+            ChiqFakeLLM.__init__(self)
+
+    eng = Engine(cfg, Both())
+    eng.corpus = lambda d: {"a": "nav market cap", "b": "kubernetes pod", "c": "fund nav", "d": "x"}
+    eng._reranker = Reranker("ce", model=SpyCE())
+    rec = eng.run(task("What is NAV?", "Which one is more important?"), "chiq:dense+rerank")
+    assert set(seen) == {"NAV vs market cap importance"}
+    assert rec.query.startswith("NAV vs market cap importance") and rec.query_info["calls"] == 6
+
+
+def test_chiq_drops_refusal_pseudo_response():
+    from arag.queries import is_refusal
+
+    assert is_refusal("The provided context does not contain information about NAV.")
+    assert is_refusal("I'm sorry, but I don't have the answer to your question.")
+    assert not is_refusal("Market cap matters more for stocks.")
+    t = task("What is NAV?", "Which one is more important?")
+    q = QueryBuilder(ChiqFakeLLM(pr="The provided context does not state this."), "m").build(t, "chiq")
+    assert "provided context" not in q.text and not q.info["pseudo_response_used"]
+    assert q.text == "NAV vs market cap importance Which is more important, NAV or market cap?"

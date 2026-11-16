@@ -27,11 +27,11 @@ cp .env.example .env && source .env
 
 Строка вида `<query>:<retriever>[+rerank]`:
 
-- query: `last` · `user_concat` (последние 3 реплики пользователя) · `gold_rewrite` (human rewrite, верхняя граница для rewrite) · `llm_rewrite`
+- query: `last` · `user_concat` (последние 3 реплики пользователя) · `gold_rewrite` (human rewrite) · `llm_rewrite` (1 вызов LLM) · `chiq` (CHIQ-AD: улучшение истории + rewrite, 5–6 вызовов)
 - retriever: `bm25` · `dense` (`bge-m3` через `/v1/embeddings` сервера; `dense.backend: local` — sentence-transformers) · `hybrid` (RRF)
 - `+rerank`: локальный cross-encoder по top-50 (`reranker.model` в `config.yaml`, проверка: `arag rerank-check`)
 
-Всего 24 стратегии (`all`), из них 12 без LLM (`no_llm`) и 12 без reranker (`no_rerank`). Reranker пока требует локальный cross-encoder (`[neural]`), на сервере его нет.
+Всего 30 стратегий (`all`), из них 18 без LLM (`no_llm`) и 15 без reranker (`no_rerank`). Reranker пока требует локальный cross-encoder (`[neural]`), на сервере его нет.
 
 ## Команды
 

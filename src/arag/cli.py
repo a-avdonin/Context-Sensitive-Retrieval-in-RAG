@@ -11,9 +11,10 @@ from .data import DOMAINS, load_tasks
 from .llm import LLM, parallel_map
 from .metrics import aggregate, per_query, read_jsonl, records_to_run, write_jsonl
 from .pipeline import Engine, Strategy, all_strategies, record_to_dict
+from .queries import LLM_QUERY_MODES
 from .routers import build_router
 
-COST_WEIGHT = {"query": {"last": 0, "user_concat": 0, "gold_rewrite": 0, "llm_rewrite": 3},
+COST_WEIGHT = {"query": {"last": 0, "user_concat": 0, "gold_rewrite": 0, "llm_rewrite": 3, "chiq": 6},
                "retriever": {"bm25": 0, "dense": 1, "hybrid": 1.5}, "rerank": 2}
 
 
@@ -64,7 +65,7 @@ def _strategies(names: list[str]) -> list[str]:
         if n == "all":
             out += all_strategies()
         elif n == "no_llm":
-            out += [s for s in all_strategies() if "llm_rewrite" not in s]
+            out += [s for s in all_strategies() if Strategy.parse(s).query not in LLM_QUERY_MODES]
         elif n == "no_rerank":  # всё, что не требует локального cross-encoder
             out += [s for s in all_strategies() if not s.endswith("+rerank")]
         else:
@@ -82,7 +83,7 @@ def cmd_run(cfg, args):
             print(f"skip {s}: {path} exists")
             continue
         st = Strategy.parse(s)
-        if st.query == "llm_rewrite":
+        if st.query in LLM_QUERY_MODES:
             _prefetch(lambda t: engine.qb.build(t, st.query), [t for t in tasks if t.history], _workers(cfg, args),
                       f"{st.query} (LLM)")
         if st.retriever in ("dense", "hybrid") and cfg["dense"].get("backend") == "api":
@@ -273,10 +274,11 @@ def cmd_route(cfg, args):
     # но уже полученные ответы лежат в кэше — перезапуск продолжит с того же места
     routes = parallel_map(router.route, tasks, _workers(cfg, args) if llm else 1, f"route:{args.router}")
     missing = [t for t, r in zip(tasks, routes)
-               if t.task_id not in runs.get(r.strategy, {}) and Strategy.parse(r.strategy).query == "llm_rewrite"]
+               if t.task_id not in runs.get(r.strategy, {}) and Strategy.parse(r.strategy).query in LLM_QUERY_MODES]
     if missing:
         engine = Engine(cfg, llm or _llm(cfg))
-        _prefetch(lambda t: engine.qb.build(t, "llm_rewrite"), missing, _workers(cfg, args), "llm_rewrite (LLM)")
+        for mode in {Strategy.parse(r.strategy).query for t, r in zip(tasks, routes) if t in missing}:
+            _prefetch(lambda t: engine.qb.build(t, mode), missing, _workers(cfg, args), f"{mode} (LLM)")
     for t, route in tqdm(list(zip(tasks, routes)), desc=args.router):
         rec = runs.get(route.strategy, {}).get(t.task_id)
         if rec is None:
