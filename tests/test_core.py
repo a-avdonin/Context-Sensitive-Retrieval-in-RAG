@@ -200,3 +200,54 @@ def test_engine_dense_api_latency(tmp_path):
     rec = eng.run(task("What is NAV fund?"), "last:dense")
     assert rec.latency_ms["embed"] == 12.5 and len(rec.hits) == 2
     assert {h[0] for h in rec.hits} <= {"a", "b", "c"}
+
+
+class FakeCrossEncoder:
+    """Оценка = число общих слов запроса и пассажа."""
+
+    def __init__(self):
+        self.pairs = 0
+
+    def predict(self, pairs, batch_size=32, show_progress_bar=False):
+        self.pairs += len(pairs)
+        return [len(set(q.lower().split()) & set(p.lower().split())) for q, p in pairs]
+
+
+def test_reranker_cache_and_latency(tmp_path):
+    from arag.retrievers import Reranker
+
+    corpus = {"a": "kubernetes pod", "b": "net asset value of a fund", "c": "fund nav value"}
+    fake = FakeCrossEncoder()
+    rr = Reranker("m", cache_path=tmp_path / "rr.sqlite", model=fake)
+    hits = rr.rerank("nav value fund", [("a", 1.0), ("b", 0.9), ("c", 0.8)], corpus, 2)
+    assert [h[0] for h in hits] == ["c", "b"] and fake.pairs == 3 and rr.last_computed == 3
+    lat = rr.last_latency_ms
+    # повтор и частично пересекающийся набор кандидатов: считаются только новые пары
+    rr.rerank("nav value fund", [("c", 0), ("a", 0)], corpus, 2)
+    assert fake.pairs == 3 and rr.last_computed == 0 and rr.last_latency_ms > 0
+    corpus["d"] = "nav"
+    rr.rerank("nav value fund", [("c", 0), ("d", 0)], corpus, 2)
+    assert fake.pairs == 4 and rr.last_computed == 1
+    # кэш переживает перезапуск; другая модель — другие ключи
+    rr2 = Reranker("m", cache_path=tmp_path / "rr.sqlite", model=FakeCrossEncoder())
+    rr2.rerank("nav value fund", [("a", 0), ("b", 0), ("c", 0)], corpus, 3)
+    assert rr2.model.pairs == 0 and abs(rr2.last_latency_ms - lat) < 1e-6
+    rr3 = Reranker("other", cache_path=tmp_path / "rr.sqlite", model=FakeCrossEncoder())
+    rr3.rerank("nav value fund", [("a", 0)], corpus, 1)
+    assert rr3.model.pairs == 1
+
+
+def test_engine_rerank_records_model(tmp_path):
+    from arag.pipeline import Engine
+    from arag.retrievers import Reranker
+
+    cfg = {"cache_dir": str(tmp_path), "data_dir": "", "retrieval": {"top_k": 2, "first_stage_k": 5, "rrf_k": 60},
+           "dense": {"backend": "api", "model": "m", "batch_size": 4, "workers": 1},
+           "reranker": {"model": "fake-ce", "candidates": 3},
+           "llm": {"rewrite_model": "m", "max_history_turns": 6}}
+    eng = Engine(cfg, FakeEmbedLLM())
+    eng.corpus = lambda d: {"a": "net asset value fund", "b": "kubernetes pod", "c": "fund nav", "d": "x y"}
+    eng._reranker = Reranker("fake-ce", model=FakeCrossEncoder())
+    rec = eng.run(task("What is NAV fund?"), "last:dense+rerank")
+    assert rec.reranker == "fake-ce" and rec.rerank_pairs == 3 and "rerank" in rec.latency_ms
+    assert eng.run(task("What is NAV fund?"), "last:dense").reranker == ""
