@@ -1,5 +1,7 @@
 # Анализ: mtrag
 
+Промежуточный отчёт по 24 стратегиям до добавления CHIQ-AD. [Анализ всех 30 стратегий](mtrag_analysis.md)
+
 Задач с qrels: 777. Метрика: `ndcg_cut_5`. Стратегии: `llm_rewrite:dense+rerank`, `llm_rewrite:hybrid+rerank`, `gold_rewrite:hybrid+rerank`, `gold_rewrite:dense+rerank`, `llm_rewrite:bm25+rerank`, `last:hybrid+rerank`, `llm_rewrite:dense`, `last:dense+rerank`, `gold_rewrite:bm25+rerank`, `gold_rewrite:dense`, `llm_rewrite:hybrid`, `last:bm25+rerank`, `last:dense`, `gold_rewrite:hybrid`, `last:hybrid`, `user_concat:hybrid+rerank`, `user_concat:dense+rerank`, `llm_rewrite:bm25`, `user_concat:bm25+rerank`, `user_concat:dense`, `user_concat:hybrid`, `gold_rewrite:bm25`, `last:bm25`, `user_concat:bm25`.
 
 ## 1. Состав датасета

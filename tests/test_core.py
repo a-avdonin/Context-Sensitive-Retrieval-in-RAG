@@ -435,3 +435,97 @@ def test_adaptive_rag_router(tmp_path):
     route = r.route(tasks[2])                                  # conv0, ход 3 → gamma → уровень C
     assert route.strategy == "llm_rewrite:dense+rerank" and route.latency_ms == 7.0
     assert route.rationale.startswith("level=C")
+
+
+def test_judge_scores_and_prompt():
+    from arag.generation import clean_scores, judge_texts
+
+    assert clean_scores({"correctness": 5, "faithfulness": 4.0, "completeness": 1, "comment": "ok"}) == \
+        {"correctness": 5, "faithfulness": 4, "completeness": 1, "comment": "ok"}
+    assert clean_scores({"correctness": 5, "faithfulness": 4}) == {}            # неполный ответ
+    assert clean_scores({"correctness": 7, "faithfulness": 4, "completeness": 1}) == {}
+    assert clean_scores({"correctness": True, "faithfulness": 4, "completeness": 1}) == {}
+    llm = FakeLLM('{"correctness": 4, "faithfulness": 5, "completeness": 3, "comment": "fine"}')
+    turns = [{"speaker": "user", "text": "What is NAV?"}]
+    scores, _ = judge_texts(llm, "m", turns, "NAV is net asset value.", "It is net asset value.", [])
+    assert scores["correctness"] == 4 and "(no passages retrieved)" in llm.calls[0]
+    assert "NAV is net asset value." in llm.calls[0] and "USER: What is NAV?" in llm.calls[0]
+    assert judge_texts(FakeLLM("not json"), "m", turns, "r", "a", ["p"])[0] == {}
+
+
+def test_calibration_report_and_answers_table(tmp_path):
+    import json
+
+    from arag.judging import answers_table, calibration_report, system_name
+
+    items = []
+    for k in range(12):
+        h = 1 + k % 4
+        for m in ("reference", "gpt-4o"):
+            items.append({"task_id": f"t{k}", "model_id": m,
+                          "human": {"faithfulness": h, "completeness": h, "appropriateness": h, "naturalness": 4,
+                                    "win-rate": 25.0 * h},
+                          "official": {"rb_llm": h / 4, "rl_f": 1 - h / 4, "rb_agg": 0.5},
+                          "judge": {"correctness": h + 1, "faithfulness": h + 1, "completeness": 5 - h} if k else {}})
+    rep = calibration_report(items, "judge-m")
+    assert "| судья: faithfulness | 1.00 (1.00)" in rep        # монотонная связь с людьми
+    assert "| судья: completeness | -1.00 (-1.00)" in rep
+    assert "| MTRAG: rb_agg | — |" in rep                       # константа → корреляция не определена
+    assert "Судья не вернул оценки: 2" in rep and "без reference-ответов (n = 12)" in rep
+
+    assert system_name(tmp_path / "llm_rewrite__dense+rerank.jsonl") == "llm_rewrite:dense+rerank"
+    assert system_name(tmp_path / "route_adaptive_rag.jsonl") == "route/adaptive_rag"
+    recs = [{"task_id": "a", "answer": "NAV is net asset value.", "gen_tokens": 100, "judge_tokens": 50,
+             "judge": {"correctness": 5, "faithfulness": 5, "completeness": 3}},
+            {"task_id": "b", "answer": "I cannot answer: the passages do not contain this.", "gen_tokens": 300,
+             "judge_tokens": 50, "judge": {}}]
+    p = tmp_path / "route_rule.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in recs))
+    rows, per_task = answers_table([p], lambda tid: True)
+    assert rows[0]["system"] == "route/rule" and rows[0]["n"] == 2 and rows[0]["judged"] == 1
+    assert rows[0]["correctness"] == 5.0 and rows[0]["declined"] == 0.5 and rows[0]["gen_tokens"] == 200.0
+    assert per_task == {"route/rule": {"a": recs[0]["judge"]}}
+
+
+def test_cmd_answer_and_summary(tmp_path, monkeypatch, capsys):
+    import json
+    from types import SimpleNamespace
+
+    import arag.cli as cli
+    import arag.data as data
+
+    ts = []
+    for k in range(6):
+        t = task("What is NAV?") if k % 2 == 0 else task("What is NAV?", "How is it calculated?")
+        t.task_id, t.meta = f"c{k}<::>{1 + k % 2}", {"answerability": "ANSWERABLE", "targets": ["NAV is ..."]}
+        ts.append(t)
+    monkeypatch.setattr(cli, "_tasks", lambda cfg, args: (ts, {}))
+    monkeypatch.setattr(data, "load_corpus", lambda root, d: {"a": "net asset value", "b": "other"})
+
+    class GenJudge:
+        def chat(self, model, messages, max_tokens=512, **kw):
+            if model == "judge":
+                return LLMResult('{"correctness": 4, "faithfulness": 5, "completeness": 3}', 200, 20, 5.0)
+            return LLMResult("NAV is net asset value.", 300, 10, 9.0)
+
+    monkeypatch.setattr(cli, "_llm", lambda cfg: GenJudge())
+    cfg = {"runs_dir": str(tmp_path), "data_dir": "", "eval": {"k_values": [1, 3, 5, 10]},
+           "llm": {"generator_model": "gen", "judge_model": "judge", "max_history_turns": 6, "workers": 2}}
+    (tmp_path / "mtrag").mkdir()
+    (tmp_path / "mtrag_routes").mkdir()
+    run = tmp_path / "mtrag" / "last__dense.jsonl"
+    route = tmp_path / "mtrag_routes" / "rule.jsonl"
+    for p in (run, route):
+        p.write_text("\n".join(json.dumps({"task_id": t.task_id, "hits": [["a", 1.0], ["b", 0.5]]}) for t in ts))
+    args = SimpleNamespace(dataset="mtrag", run=[str(run), str(route)], k=1, sample=4, seed=0, workers=None)
+    cli.cmd_answer(cfg, args)
+    a = [json.loads(l) for l in open(tmp_path / "mtrag_answers" / "last__dense.jsonl")]
+    b = [json.loads(l) for l in open(tmp_path / "mtrag_answers" / "route_rule.jsonl")]
+    assert len(a) == 4 and {r["task_id"] for r in a} == {r["task_id"] for r in b}   # одна выборка для всех
+    assert a[0]["docs"] == ["a"] and a[0]["judge"]["correctness"] == 4 and a[0]["gen_tokens"] == 310
+    assert not list((tmp_path / "mtrag").glob("*answers*"))                          # run-папка не засоряется
+    capsys.readouterr()
+    cli.cmd_answers_summary(cfg, SimpleNamespace(dataset="mtrag", slice="all", baseline="last:dense",
+                                                 metric="correctness", n=200))
+    out = capsys.readouterr().out
+    assert "route/rule\t4\t4\t4.0000\t5.0000\t3.0000" in out and "baseline=last:dense" in out
