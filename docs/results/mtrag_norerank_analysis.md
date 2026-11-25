@@ -1,5 +1,7 @@
 # Анализ: mtrag
 
+Промежуточный отчёт по 12 стратегиям без реранкера. [Анализ всех 30 стратегий](mtrag_analysis.md)
+
 Задач с qrels: 777. Метрика: `ndcg_cut_5`. Стратегии: `llm_rewrite:dense`, `gold_rewrite:dense`, `llm_rewrite:hybrid`, `last:dense`, `gold_rewrite:hybrid`, `last:hybrid`, `llm_rewrite:bm25`, `user_concat:dense`, `user_concat:hybrid`, `gold_rewrite:bm25`, `last:bm25`, `user_concat:bm25`.
 
 ## 1. Состав датасета
