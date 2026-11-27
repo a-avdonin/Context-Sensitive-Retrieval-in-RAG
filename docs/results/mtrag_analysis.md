@@ -1,6 +1,6 @@
 # Анализ: mtrag
 
-Полный срез сохранённых прогонов поиска на MTRAG. Таблицы по роутерам и качеству ответов приведены в [отчёте по ответам](mtrag_answers.md) и [README проекта](../../README.md).
+Полный срез сохранённых прогонов поиска на MTRAG. [Роутеры и качество ответов](mtrag_answers.md) · [Основные результаты](../../README.md) · [Команды воспроизведения](../reproduction.md#mtrag)
 
 Задач с qrels: 777. Метрика: `ndcg_cut_5`. Стратегии: `llm_rewrite:dense+rerank`, `llm_rewrite:hybrid+rerank`, `chiq:dense+rerank`, `chiq:hybrid+rerank`, `gold_rewrite:hybrid+rerank`, `chiq:bm25+rerank`, `gold_rewrite:dense+rerank`, `chiq:hybrid`, `llm_rewrite:bm25+rerank`, `last:hybrid+rerank`, `llm_rewrite:dense`, `last:dense+rerank`, `chiq:dense`, `gold_rewrite:bm25+rerank`, `gold_rewrite:dense`, `llm_rewrite:hybrid`, `last:bm25+rerank`, `last:dense`, `chiq:bm25`, `gold_rewrite:hybrid`, `last:hybrid`, `user_concat:hybrid+rerank`, `user_concat:dense+rerank`, `llm_rewrite:bm25`, `user_concat:bm25+rerank`, `user_concat:dense`, `user_concat:hybrid`, `gold_rewrite:bm25`, `last:bm25`, `user_concat:bm25`.
 
@@ -41,9 +41,9 @@
 | ANSWERABLE | 709 | 620 | 0.912 |
 | PARTIAL | 68 | 55 | 0.088 |
 
-### Тип вопроса
+### Первая метка типа вопроса
 
-| Тип вопроса | задач | из них later | доля |
+| Первая метка типа вопроса | задач | из них later | доля |
 |---|---|---|---|
 | Factoid | 220 | 187 | 0.283 |
 | Explanation | 134 | 119 | 0.172 |
@@ -109,7 +109,7 @@ Human rewrite есть у 675 из 675 later-задач; у остальных `
 | ANSWERABLE | 709 | 0.447 | 0.448 | 0.437 | 0.437 | 0.419 | 0.414 | 0.415 | 0.399 | 0.399 | 0.400 | 0.391 | 0.396 | 0.395 | 0.370 | 0.366 | 0.340 | 0.343 | 0.345 | 0.319 | 0.315 | 0.299 | 0.260 | 0.259 | 0.246 | 0.245 | 0.238 | 0.238 | 0.216 | 0.199 | 0.178 |
 | PARTIAL | 68 | 0.393 | 0.375 | 0.390 | 0.385 | 0.345 | 0.378 | 0.342 | 0.349 | 0.338 | 0.249 | 0.323 | 0.260 | 0.273 | 0.335 | 0.268 | 0.344 | 0.243 | 0.200 | 0.313 | 0.294 | 0.217 | 0.241 | 0.241 | 0.270 | 0.207 | 0.253 | 0.245 | 0.239 | 0.173 | 0.168 |
 
-### По `question_type`
+### По `question_type` (первая метка)
 
 | question_type | n | llm_rewrite:dense+rerank | llm_rewrite:hybrid+rerank | chiq:dense+rerank | chiq:hybrid+rerank | gold_rewrite:hybrid+rerank | chiq:bm25+rerank | gold_rewrite:dense+rerank | chiq:hybrid | llm_rewrite:bm25+rerank | last:hybrid+rerank | llm_rewrite:dense | last:dense+rerank | chiq:dense | gold_rewrite:bm25+rerank | gold_rewrite:dense | llm_rewrite:hybrid | last:bm25+rerank | last:dense | chiq:bm25 | gold_rewrite:hybrid | last:hybrid | user_concat:hybrid+rerank | user_concat:dense+rerank | llm_rewrite:bm25 | user_concat:bm25+rerank | user_concat:dense | user_concat:hybrid | gold_rewrite:bm25 | last:bm25 | user_concat:bm25 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -124,7 +124,7 @@ Human rewrite есть у 675 из 675 later-задач; у остальных `
 | Summarization | 90 | 0.404 | 0.398 | 0.373 | 0.371 | 0.370 | 0.350 | 0.374 | 0.364 | 0.359 | 0.367 | 0.332 | 0.370 | 0.333 | 0.341 | 0.327 | 0.332 | 0.309 | 0.304 | 0.297 | 0.314 | 0.275 | 0.234 | 0.243 | 0.224 | 0.233 | 0.216 | 0.248 | 0.200 | 0.154 | 0.184 |
 | Troubleshooting | 12 | 0.578 | 0.594 | 0.583 | 0.622 | 0.654 | 0.539 | 0.654 | 0.477 | 0.530 | 0.607 | 0.390 | 0.552 | 0.459 | 0.570 | 0.429 | 0.433 | 0.518 | 0.405 | 0.487 | 0.443 | 0.467 | 0.355 | 0.375 | 0.472 | 0.272 | 0.322 | 0.306 | 0.486 | 0.482 | 0.310 |
 
-### По `dependent` (`dependent` — эвристика RuleRouter: later-ход с местоимением, короткий или без вопроса; first_turn — первый ход)
+### По `dependent` (эвристика RuleRouter: later-ход с местоимением, короткий или без вопроса; first_turn — первый ход)
 
 | dependent | n | llm_rewrite:dense+rerank | llm_rewrite:hybrid+rerank | chiq:dense+rerank | chiq:hybrid+rerank | gold_rewrite:hybrid+rerank | chiq:bm25+rerank | gold_rewrite:dense+rerank | chiq:hybrid | llm_rewrite:bm25+rerank | last:hybrid+rerank | llm_rewrite:dense | last:dense+rerank | chiq:dense | gold_rewrite:bm25+rerank | gold_rewrite:dense | llm_rewrite:hybrid | last:bm25+rerank | last:dense | chiq:bm25 | gold_rewrite:hybrid | last:hybrid | user_concat:hybrid+rerank | user_concat:dense+rerank | llm_rewrite:bm25 | user_concat:bm25+rerank | user_concat:dense | user_concat:hybrid | gold_rewrite:bm25 | last:bm25 | user_concat:bm25 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -175,6 +175,6 @@ win/tie/loss — сравнение `gold_rewrite:bm25` с `last:bm25` по за
 | дефицит | n | last | gold | Δ mean | win | loss |
 |---|---|---|---|---|---|---|
 | 0 | 177 | 0.240 | 0.234 | -0.005 | 10 | 13 |
-| (0, 1/3) | 134 | 0.220 | 0.226 | 0.006 | 26 | 23 |
-| [1/3, 2/3) | 215 | 0.161 | 0.187 | 0.026 | 49 | 36 |
-| [2/3, 1] | 149 | 0.081 | 0.158 | 0.077 | 38 | 16 |
+| (0, 1/3) | 100 | 0.235 | 0.229 | -0.006 | 18 | 20 |
+| [1/3, 2/3) | 216 | 0.164 | 0.192 | 0.027 | 47 | 33 |
+| [2/3, 1] | 182 | 0.094 | 0.163 | 0.069 | 48 | 22 |

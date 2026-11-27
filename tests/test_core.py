@@ -578,3 +578,45 @@ def test_cmd_answer_and_summary(tmp_path, monkeypatch, capsys):
                                                  metric="correctness", n=200))
     out = capsys.readouterr().out
     assert "route/rule\t4\t4\t4.0000\t5.0000\t3.0000" in out and "baseline=last:dense" in out
+
+
+def test_transfer_holds_out_shared_openings_and_ids():
+    from arag.data import held_out_dialogues
+
+    source = task("What is NAV?")
+    copied = task("  WHAT is   NAV? ", "How is it calculated?")
+    copied.task_id = "copy<::>2"
+    shared_id = task("Another opening")
+    unseen = task("What is APR?")
+    unseen.task_id = "new<::>1"
+    assert held_out_dialogues([source], [copied, shared_id, unseen]) == [unseen]
+
+
+def test_paired_tests_resample_whole_dialogues():
+    import numpy as np
+
+    from arag.stats import paired_bootstrap, randomization_test
+
+    # При двух кластерах возможны эффекты 0, 1/4 и 1. Ходы имеют одинаковый вес.
+    base = np.zeros(4)
+    scores = np.array([0, 0, 0, 1])
+    groups = ["a", "a", "a", "b"]
+    assert paired_bootstrap(base, scores, groups=groups) == (0.25, 0.0, 1.0)
+    # Все три выигрыша в одном диалоге меняют знак одновременно.
+    assert randomization_test(base, [1, 1, 1, 0], groups=groups) == 1
+
+
+def test_rewrite_report_assigns_exact_thirds():
+    from arag.analysis import build_report
+
+    tasks = []
+    for i, query in enumerate(["apple orange pear", "apple orange", "apple", "mango"]):
+        t = task("Earlier question", query)
+        t.task_id, t.gold_rewrite = str(i), "apple orange pear"
+        tasks.append(t)
+    qrels = {t.task_id: {"d": 1} for t in tasks}
+    scores = {t.task_id: {"ndcg_cut_5": 1.0} for t in tasks}
+    report = build_report(tasks, qrels, {"last:bm25": scores, "gold_rewrite:bm25": scores}, "ndcg_cut_5", "test")
+    bins = report.split("### Выигрыш от rewrite")[-1]
+    assert "| 0 | 1 |" in bins and "| (0, 1/3) |" not in bins
+    assert "| [1/3, 2/3) | 1 |" in bins and "| [2/3, 1] | 2 |" in bins
