@@ -264,16 +264,27 @@ def cmd_significance(cfg, args):
 
 
 def cmd_route(cfg, args):
+    train_dataset = args.train_dataset
+    if train_dataset and (args.router != "adaptive_rag" or train_dataset == args.dataset):
+        raise SystemExit("--train-dataset требует --router adaptive_rag и отдельный датасет обучения")
     tasks, qrels = _tasks(cfg, args)
     runs = {s: {r["task_id"]: r for r in recs} for s, recs in _load_runs(cfg, args.dataset).items()}
     llm = _llm(cfg) if args.router.startswith("llm") or args.router == "adaptive_rag" else None
     router = build_router(args.router, cfg, llm, args.fixed, args.dataset)
-    if hasattr(router, "prepare"):  # обучаемые роутеры: обучение + предсказания по кросс-валидации
-        rep = router.prepare(tasks, qrels)
+    if args.router == "adaptive_rag":
+        if train_dataset:
+            train_tasks, train_qrels = load_tasks(cfg["data_dir"], train_dataset)
+            train_tasks = [t for t in train_tasks if t.meta["has_qrels"]]
+            rep = router.prepare_transfer(train_dataset, train_tasks, train_qrels, tasks)
+            print(f"adaptive_rag: обучение на {train_dataset}, применение к {args.dataset}")
+        else:
+            rep = router.prepare(tasks, qrels)
         print(f"{args.router}: уровни {rep['levels']}")
         print(f"  метки (самый простой лучший уровень): {rep['label_dist']}, без метки (все 0): {rep['unlabeled']}")
-        print(f"  CV accuracy {rep['cv_accuracy']:.3f} (всегда частый класс: {rep['majority_accuracy']:.3f})")
-        print(f"  предсказано: {rep['pred_dist']}; confusion (строки — метка): {rep['confusion']}")
+        print(f"  предсказано: {rep['pred_dist']}")
+        if not train_dataset:
+            print(f"  CV accuracy {rep['cv_accuracy']:.3f} (всегда частый класс: {rep['majority_accuracy']:.3f})")
+            print(f"  confusion (строки — метка): {rep['confusion']}")
     engine = None
     out = []
     # решения роутера считаем параллельно; ошибка API после всех повторов роняет прогон,
@@ -299,6 +310,8 @@ def cmd_route(cfg, args):
         out.append(rec | {"route": route.strategy, "rationale": route.rationale})
 
     name = args.router if args.router != "fixed" else f"fixed_{args.fixed.replace(':', '__')}"
+    if train_dataset:
+        name = f"{name}_from_{train_dataset}"
     write_jsonl(Path(cfg["runs_dir"]) / f"{args.dataset}_routes" / f"{name}.jsonl", out)
     scores = per_query(qrels, records_to_run(out), cfg["eval"]["k_values"])
     slices, _ = _slices(tasks)
@@ -678,8 +691,11 @@ def main():
     sp = sub.add_parser("route", help="оценить роутер")
     common(sp)
     sp.add_argument("--router", default="rule",
-                    choices=["fixed", "rule", "llm_nohist", "llm_hist", "adaptive_rag", "oracle", "oracle_cheap"])
+                    choices=["fixed", "rule", "llm_nohist", "llm_hist", "llm_nohist_rewrite", "adaptive_rag",
+                             "oracle", "oracle_cheap"])
     sp.add_argument("--fixed", default="last:hybrid+rerank")
+    sp.add_argument("--train-dataset", choices=["mtrag", "mtragun"],
+                    help="отдельный датасет обучения для adaptive_rag; без флага используется кросс-валидация")
 
     sp = sub.add_parser("routes-summary", help="сводная таблица роутеров: качество, решения, стоимость")
     common(sp)
