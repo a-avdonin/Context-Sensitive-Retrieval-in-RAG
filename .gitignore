@@ -222,3 +222,4 @@ data/
 runs/
 cache/
 .claude
+.DS_store
