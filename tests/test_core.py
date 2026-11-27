@@ -72,9 +72,21 @@ def test_oracle_router(tmp_path):
 
 
 def test_llm_router_history_and_fallback():
+    from arag.config import load_config
+    from arag.routers import build_router
+
     t = task("What is NAV?", "How is it calculated?")
-    ok = LLMRouter(FakeLLM('{"rewrite": true, "retriever": "dense", "rerank": true, "reason": "pronoun"}'), "m", True)
+    cfg = load_config()
+    reply = '{"rewrite": true, "retriever": "dense", "rerank": true, "reason": "pronoun"}'
+    ok = build_router("llm_hist", cfg, FakeLLM(reply))
     assert ok.route(t).strategy == "llm_rewrite:dense+rerank"
+    control = build_router("llm_nohist_rewrite", cfg, FakeLLM(reply))
+    assert control.route(t).strategy == "llm_rewrite:dense+rerank"
+    assert control.llm.calls[0] == ok.llm.calls[0].replace("USER: What is NAV?\nAGENT: answer", "(empty)")
+    first_turn = task("What is NAV?")
+    ok.route(first_turn)
+    control.route(first_turn)
+    assert control.llm.calls[1] == ok.llm.calls[1]
     nohist = LLMRouter(FakeLLM('{"rewrite": true, "retriever": "bm25", "rerank": false}'), "m", False)
     assert nohist.route(t).strategy == "last:bm25"
     assert "What is NAV?" not in nohist.llm.calls[0]
@@ -385,7 +397,7 @@ def test_chiq_drops_refusal_pseudo_response():
     assert q.text == "NAV vs market cap importance Which is more important, NAV or market cap?"
 
 
-def test_adaptive_rag_router(tmp_path):
+def test_adaptive_rag_router(tmp_path, monkeypatch):
     import json
 
     import numpy as np
@@ -435,6 +447,43 @@ def test_adaptive_rag_router(tmp_path):
     route = r.route(tasks[2])                                  # conv0, ход 3 → gamma → уровень C
     assert route.strategy == "llm_rewrite:dense+rerank" and route.latency_ms == 7.0
     assert route.rationale.startswith("level=C")
+
+    from arag import cli
+    from arag.metrics import read_jsonl, write_jsonl
+
+    holdout = Task("holdout<::>1", "fiqa", [{"speaker": "user", "text": "gamma test"}])
+    target_runs = tmp_path / "mtragun"
+    target_runs.mkdir()
+    # Разметка теста даёт выигрыш уровню A. Роутер должен выбрать C по обучению на gamma из MTRAG.
+    for i, level in enumerate(levels):
+        write_jsonl(target_runs / f"{level.replace(':', '__')}.jsonl", [{
+            "task_id": holdout.task_id, "hits": [["rel" if i == 0 else "junk", 1.0]],
+            "latency_ms": {"total": 10.0}, "prompt_tokens": 0, "completion_tokens": 0,
+        }])
+    cfg = cli.load_config()
+    cfg["runs_dir"] = str(tmp_path)
+    cfg["llm"]["workers"] = 1
+    for t in tasks:
+        t.meta["has_qrels"] = True
+    holdout.meta["has_qrels"] = True
+
+    def load_fixture(_root, dataset, domains=None):
+        return (tasks, qrels) if dataset == "mtrag" else ([holdout], {holdout.task_id: {"rel": 1}})
+
+    monkeypatch.setattr(cli, "_llm", lambda _cfg: WordEmb())
+    monkeypatch.setattr(cli, "load_tasks", load_fixture)
+    monkeypatch.setattr(cli, "load_config", lambda _path: cfg)
+    monkeypatch.setattr("sys.argv", [
+        "arag", "route", "--router", "adaptive_rag", "--dataset", "mtragun", "--train-dataset", "mtrag",
+    ])
+    cv_path = tmp_path / "mtragun_routes" / "adaptive_rag.jsonl"
+    cv_path.parent.mkdir()
+    cv_path.write_text("existing CV result\n")
+    cli.main()
+    result = read_jsonl(tmp_path / "mtragun_routes" / "adaptive_rag_from_mtrag.jsonl")
+    assert len(result) == 1 and result[0]["route"] == levels[2]
+    assert result[0]["hits"] == [["junk", 1.0]]
+    assert cv_path.read_text() == "existing CV result\n"
 
 
 def test_judge_scores_and_prompt():

@@ -4,6 +4,7 @@ fixed        — один пайплайн для всех запросов
 rule         — эвристики по запросу и истории: переписывать только зависимые от контекста вопросы
 llm_nohist   — LLM видит только последний вопрос (аналог Adaptive-RAG: адаптация по сложности)
 llm_hist     — LLM видит вопрос и историю, решает про rewrite, ретривер и reranking
+llm_nohist_rewrite — контроль для llm_hist с пустым полем истории и теми же действиями
 adaptive_rag — Adaptive-RAG: классификатор сложности по одному вопросу выбирает уровень A/B/C
 oracle       — лучшая стратегия по разметке оракула (верхняя граница, не реализуем)
 oracle_cheap — самая дешёвая стратегия в пределах eps от лучшей (верхняя граница с учётом стоимости)
@@ -114,20 +115,21 @@ Answer with JSON only: {{"retriever": "bm25|dense|hybrid", "rerank": bool, "reas
 
 class LLMRouter:
     def __init__(self, llm: LLM, model: str, use_history: bool, max_history_turns: int = 6,
-                 fallback: str = "last:dense"):
+                 fallback: str = "last:dense", *, allow_rewrite: bool = False):
         self.llm, self.model, self.use_history = llm, model, use_history
         self.max_turns, self.fallback = max_history_turns, fallback
+        self.allow_rewrite = use_history or allow_rewrite
 
     def route(self, task: Task) -> Route:
-        if self.use_history:
-            prompt = PROMPT_HIST.format(history=format_history(task.history, self.max_turns) or "(empty)",
-                                        query=task.query)
+        if self.allow_rewrite:
+            history = format_history(task.history, self.max_turns) if self.use_history else ""
+            prompt = PROMPT_HIST.format(history=history or "(empty)", query=task.query)
         else:
             prompt = PROMPT_NOHIST.format(query=task.query)
         r = self.llm.chat(self.model, [{"role": "user", "content": prompt}], max_tokens=200)
         try:
             d = parse_json(r.text)
-            query = "llm_rewrite" if self.use_history and d.get("rewrite") else "last"
+            query = "llm_rewrite" if self.allow_rewrite and d.get("rewrite") else "last"
             strategy = str(Strategy(query, d["retriever"], bool(d.get("rerank"))))
             Strategy.parse(strategy)
         except Exception:
@@ -144,7 +146,7 @@ class AdaptiveRAGRouter:
     Отличия: уровни — наши стратегии (A/B/C из config), а не no-retrieval/single-step/multi-step;
     классификатор — логистическая регрессия на эмбеддингах bge-m3, а не дообученный T5-large;
     запросы, где все уровни дают 0, в обучение не идут (у авторов им ставится метка по типу датасета).
-    Предсказания — кросс-валидация по диалогам (GroupKFold): модель не видела диалог задачи.
+    Предсказания получаются кросс-валидацией по диалогам или переносом с отдельного датасета.
     """
 
     def __init__(self, llm, emb_model: str, query_prefix: str, levels: list[str], runs_dir: Path, dataset: str,
@@ -158,16 +160,19 @@ class AdaptiveRAGRouter:
         self.embed_ms: dict[str, float] = {}
         self.report: dict = {}
 
-    def _level_scores(self, tasks, qrels) -> dict[str, list[float]]:
+    def _level_scores(self, tasks, qrels, train_dataset: str | None = None) -> dict[str, list[float]]:
         from .metrics import per_query, read_jsonl, records_to_run
 
         ids = {t.task_id for t in tasks}
         out = {}
         for s in self.levels:
-            path = self.runs_dir / self.dataset / f"{s.replace(':', '__')}.jsonl"
+            path = self.runs_dir / (train_dataset or self.dataset) / f"{s.replace(':', '__')}.jsonl"
             if not path.exists():
                 raise FileNotFoundError(f"{path}: нужен run уровня {s} (arag run --strategies {s})")
-            sc = per_query(qrels, records_to_run([r for r in read_jsonl(path) if r["task_id"] in ids]))
+            run = records_to_run([r for r in read_jsonl(path) if r["task_id"] in ids])
+            if train_dataset and (missing := ids - run.keys()):
+                raise ValueError(f"{path}: в обучающем прогоне отсутствуют {len(missing)} задач")
+            sc = per_query(qrels, run)
             for tid in ids:
                 out.setdefault(tid, []).append(sc.get(tid, {}).get(self.metric, 0.0))
         return out
@@ -180,33 +185,44 @@ class AdaptiveRAGRouter:
             return None
         return next(i for i, v in enumerate(scores) if v >= best - eps - 1e-12)
 
-    def prepare(self, tasks, qrels):
+    def _embeddings(self, tasks):
         import numpy as np
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.model_selection import GroupKFold
 
         from .llm import parallel_map
 
-        scores = self._level_scores(tasks, qrels)
-        labels = [self.label(scores[t.task_id], self.eps) for t in tasks]
         embs = parallel_map(lambda t: self.llm.embed_one(self.emb_model, self.prefix + t.query), tasks,
                             self.workers, "adaptive_rag: query embeddings")
         X = np.stack([v for v, _ in embs]).astype(np.float32)
         X /= np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-12)
-        self.embed_ms = {t.task_id: ms for t, (_, ms) in zip(tasks, embs)}
+        return X, {t.task_id: ms for t, (_, ms) in zip(tasks, embs)}
+
+    def _predict(self, train_X, train_y, test_X):
+        import numpy as np
+        from sklearn.linear_model import LogisticRegression
+
+        classes = np.unique(train_y)
+        if len(classes) == 0:
+            raise ValueError("Adaptive-RAG: нет обучающих задач с ненулевым результатом поиска")
+        if len(classes) == 1:
+            return np.full(len(test_X), classes[0]), np.ones(len(test_X))
+        clf = LogisticRegression(C=self.C, max_iter=2000).fit(train_X, train_y)
+        proba = clf.predict_proba(test_X)
+        return clf.classes_[proba.argmax(1)], proba.max(1)
+
+    def prepare(self, tasks, qrels):
+        import numpy as np
+        from sklearn.model_selection import GroupKFold
+
+        scores = self._level_scores(tasks, qrels)
+        labels = [self.label(scores[t.task_id], self.eps) for t in tasks]
+        X, self.embed_ms = self._embeddings(tasks)
         groups = np.array([t.task_id.split("<::>")[0] for t in tasks])
         y = np.array([-1 if l is None else l for l in labels])
         pred = np.zeros(len(tasks), dtype=int)
         conf = np.zeros(len(tasks))
         for tr, te in GroupKFold(n_splits=self.folds).split(X, y, groups):
             tr = tr[y[tr] >= 0]
-            if len(set(y[tr])) == 1:
-                pred[te], conf[te] = y[tr][0], 1.0
-                continue
-            clf = LogisticRegression(C=self.C, max_iter=2000).fit(X[tr], y[tr])
-            proba = clf.predict_proba(X[te])
-            pred[te] = clf.classes_[proba.argmax(1)]
-            conf[te] = proba.max(1)
+            pred[te], conf[te] = self._predict(X[tr], y[tr], X[te])
         self.pred = {t.task_id: (int(p), float(c)) for t, p, c in zip(tasks, pred, conf)}
 
         lab = y >= 0
@@ -220,6 +236,32 @@ class AdaptiveRAGRouter:
             "cv_accuracy": float((pred[lab] == y[lab]).mean()) if lab.any() else 0.0,
             "majority_accuracy": float(max(np.bincount(y[lab], minlength=k)) / lab.sum()) if lab.any() else 0.0,
             "confusion": cm,
+        }
+        return self.report
+
+    def prepare_transfer(self, train_dataset, train_tasks, train_qrels, tasks):
+        import numpy as np
+
+        if not train_tasks or not tasks:
+            raise ValueError("Adaptive-RAG: для переноса нужны непустые обучающая и тестовая выборки")
+        train_groups = {t.task_id.split("<::>", 1)[0] for t in train_tasks}
+        test_groups = {t.task_id.split("<::>", 1)[0] for t in tasks}
+        if train_groups & test_groups:
+            raise ValueError("Adaptive-RAG: обучающая и тестовая выборки содержат общие диалоги")
+        scores = self._level_scores(train_tasks, train_qrels, train_dataset)
+        labeled = [(t, level) for t in train_tasks if (level := self.label(scores[t.task_id], self.eps)) is not None]
+        if not labeled:
+            raise ValueError("Adaptive-RAG: нет обучающих задач с ненулевым результатом поиска")
+        train_X, _ = self._embeddings([t for t, _ in labeled])
+        train_y = np.array([level for _, level in labeled])
+        X, self.embed_ms = self._embeddings(tasks)
+        pred, conf = self._predict(train_X, train_y, X)
+        self.pred = {t.task_id: (int(p), float(c)) for t, p, c in zip(tasks, pred, conf)}
+        self.report = {
+            "levels": self.levels,
+            "label_dist": np.bincount(train_y, minlength=len(self.levels)).tolist(),
+            "unlabeled": len(train_tasks) - len(labeled),
+            "pred_dist": np.bincount(pred, minlength=len(self.levels)).tolist(),
         }
         return self.report
 
@@ -253,4 +295,6 @@ def build_router(name: str, cfg: dict, llm: LLM | None = None, fixed: str = "las
         return LLMRouter(llm, model, use_history=False, max_history_turns=turns)
     if name == "llm_hist":
         return LLMRouter(llm, model, use_history=True, max_history_turns=turns)
+    if name == "llm_nohist_rewrite":
+        return LLMRouter(llm, model, use_history=False, max_history_turns=turns, allow_rewrite=True)
     raise ValueError(name)
