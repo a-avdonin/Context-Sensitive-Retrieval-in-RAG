@@ -1,6 +1,6 @@
 # MTRAG-UN: поиск, качество ответов и стоимость
 
-Поиск оценён на 332 задачах с qrels в четырёх доменах. Основной срез — 309 последующих ходов. Для поиска прогнаны 12 фиксированных стратегий. Восемь систем сгенерировали 2656 ответов, для 2655 получены валидные оценки. Единственный пропуск у `llm_nohist` на последующем ходе. В качестве базы сравнения выбран `llm_rewrite:dense+rerank`, показавший лучший результат среди фиксированных стратегий на MTRAG. [Методика](../methodology.md) · [Результаты на MTRAG](mtrag_answers.md)
+Поиск оценён на 332 задачах с qrels в четырёх доменах. Основной срез — 309 последующих ходов. Для поиска прогнаны 12 фиксированных стратегий. Восемь систем сгенерировали 2656 ответов, для 2655 получены валидные оценки. Единственный пропуск у `llm_nohist` на последующем ходе. В качестве базы сравнения выбран `llm_rewrite:dense+rerank`, показавший лучший результат среди фиксированных стратегий на MTRAG. [Методика](../methodology.md) · [Команды воспроизведения](../reproduction.md#mtrag-un) · [Результаты на MTRAG](mtrag_answers.md)
 
 ## Последующие ходы (n = 309)
 
@@ -55,25 +55,7 @@
 
 На последующих ходах перенос дал 0.4566 nDCG@5 против 0.4434 у кросс-валидации внутри MTRAG-UN. Парная разница +0.0131 (95% ДИ [−0.0104, +0.0372]) статистически незначима. Correctness перенесённой модели составил 3.657 против 3.712 у кросс-валидации. Парная разница −0.0550 (95% ДИ [−0.1650, +0.0518], p = 0.358) также статистически незначима. Относительно dense-базы перенос использует на 67% меньше LLM-токенов поиска и на 11% меньше токенов системы, включая реранкер в 58% ходов.
 
-Команда переноса использует сохранённые прогоны трёх уровней на обоих датасетах. Исходный результат кросс-валидации сохраняется отдельно.
-
-```bash
-arag route --dataset mtragun --router adaptive_rag --train-dataset mtrag
-arag routes-summary --dataset mtragun --slice later_turns
-arag significance --dataset mtragun --slice later_turns --baseline 'llm_rewrite:dense+rerank'
-```
-
-Воспроизведение оценки ответов перенесённой модели:
-
-```bash
-source .env
-arag answer --dataset mtragun --run runs/mtragun_routes/adaptive_rag_from_mtrag.jsonl
-for slice in later_turns all; do
-  arag answers-summary --dataset mtragun --slice "$slice" --baseline 'llm_rewrite:dense+rerank'
-done
-```
-
-Исходные сводки находятся в `runs/mtragun_summary.csv`, `runs/mtragun_routes_summary_{all,later_turns}.csv` и `runs/mtragun_answers_summary_{all,later_turns}.csv`.
+Команда переноса использует сохранённые прогоны трёх уровней на обоих датасетах и записывает результат в `runs/mtragun_routes/adaptive_rag_from_mtrag.jsonl`. [Команды переноса и оценки ответов](../reproduction.md#mtrag-un)
 
 ## Контрольное сравнение для RQ2
 
@@ -87,17 +69,6 @@ done
 
 Для заранее выбранной пары приведены двусторонние p-значения парных рандомизационных тестов. Разницы по поиску и ответам статистически незначимы. История повышает долю переписываний с 18.8% до 46.3%. Токены поиска растут с 344 до 710 на задачу, а общий расход системы — с 2074 до 2451 (+18%). Вывод относится к истории на входе роутера при заданной модели и наборе действий.
 
-```bash
-source .env
-arag route --dataset mtragun --router llm_nohist_rewrite
-arag answer --dataset mtragun --run runs/mtragun_routes/llm_nohist_rewrite.jsonl
-arag routes-summary --dataset mtragun --slice later_turns
-arag significance --dataset mtragun --slice later_turns \
-  --baseline route/llm_nohist_rewrite
-arag answers-summary --dataset mtragun --slice later_turns \
-  --baseline route/llm_nohist_rewrite
-arag answers-summary --dataset mtragun --slice later_turns \
-  --baseline route/llm_nohist_rewrite --metric completeness
-```
+[Протокол сравнения](../methodology.md#роутеры-этап-4) · [Команды парных тестов](../reproduction.md#сводки-и-парные-тесты)
 
-В обеих таблицах парных тестов сравнение с историей находится в строке `route/llm_hist`. Помимо nDCG@5 и correctness, в сводках смотрим на долю переписываний, число пар реранкера и LLM-токены. [Протокол сравнения](../methodology.md#роутеры-этап-4)
+Исходные сводки находятся в `runs/mtragun_summary.csv`, `runs/mtragun_routes_summary_{all,later_turns}.csv` и `runs/mtragun_answers_summary_{all,later_turns}.csv`.

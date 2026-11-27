@@ -1,6 +1,6 @@
 # Анализ: mtrag
 
-Полный срез сохранённых прогонов поиска на MTRAG. Таблицы по роутерам и качеству ответов приведены в [отчёте по ответам](mtrag_answers.md) и [README проекта](../../README.md).
+Полный срез сохранённых прогонов поиска на MTRAG. [Роутеры и качество ответов](mtrag_answers.md) · [Основные результаты](../../README.md) · [Команды воспроизведения](../reproduction.md#mtrag)
 
 Задач с qrels: 777. Метрика: `ndcg_cut_5`. Стратегии: `llm_rewrite:dense+rerank`, `llm_rewrite:hybrid+rerank`, `chiq:dense+rerank`, `chiq:hybrid+rerank`, `gold_rewrite:hybrid+rerank`, `chiq:bm25+rerank`, `gold_rewrite:dense+rerank`, `chiq:hybrid`, `llm_rewrite:bm25+rerank`, `last:hybrid+rerank`, `llm_rewrite:dense`, `last:dense+rerank`, `chiq:dense`, `gold_rewrite:bm25+rerank`, `gold_rewrite:dense`, `llm_rewrite:hybrid`, `last:bm25+rerank`, `last:dense`, `chiq:bm25`, `gold_rewrite:hybrid`, `last:hybrid`, `user_concat:hybrid+rerank`, `user_concat:dense+rerank`, `llm_rewrite:bm25`, `user_concat:bm25+rerank`, `user_concat:dense`, `user_concat:hybrid`, `gold_rewrite:bm25`, `last:bm25`, `user_concat:bm25`.
 
