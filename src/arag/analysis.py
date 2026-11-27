@@ -92,7 +92,7 @@ def build_report(tasks: list[Task], qrels: dict, scores: dict[str, dict[str, dic
     # 1. состав датасета
     S.append("## 1. Состав датасета\n")
     for key, title in [("domain", "Домен"), ("turn", "Номер хода пользователя"), ("multi_turn", "Multi-Turn"),
-                       ("answerability", "Answerability"), ("question_type", "Тип вопроса")]:
+                       ("answerability", "Answerability"), ("question_type", "Первая метка типа вопроса")]:
         c = Counter(f[key] for f in feats.values())
         later = Counter(f[key] for f in feats.values() if f["later"])
         rows = [{title: k, "задач": v, "из них later": later.get(k, 0), "доля": v / len(feats)}
@@ -134,8 +134,10 @@ def build_report(tasks: list[Task], qrels: dict, scores: dict[str, dict[str, dic
             for s in strategies:
                 r[s] = _mean([scores[s][i][metric] for i in ids if i in scores[s]])
             rows.append(r)
-        note = " (`dependent` — эвристика RuleRouter: later-ход с местоимением, короткий или без вопроса; first_turn — первый ход)" \
-            if key == "dependent" else ""
+        note = {
+            "question_type": " (первая метка)",
+            "dependent": " (эвристика RuleRouter: later-ход с местоимением, короткий или без вопроса; first_turn — первый ход)",
+        }.get(key, "")
         S.append(f"### По `{key}`{note}\n\n" + md_table(rows, [key, "n"] + strategies) + "\n")
 
     # 4. оракул
@@ -178,10 +180,11 @@ def build_report(tasks: list[Task], qrels: dict, scores: dict[str, dict[str, dic
         S.append(md_table(rows, ["срез", "n", "Δ mean", "win", "tie", "loss"]) + "\n")
 
         # дефицит контекста vs выигрыш
-        bins = [(0, 0.001, "0"), (0.001, 0.34, "(0, 1/3)"), (0.34, 0.67, "[1/3, 2/3)"), (0.67, 1.01, "[2/3, 1]")]
+        bins = [("0", lambda x: x == 0), ("(0, 1/3)", lambda x: 0 < x < 1 / 3),
+                ("[1/3, 2/3)", lambda x: 1 / 3 <= x < 2 / 3), ("[2/3, 1]", lambda x: 2 / 3 <= x <= 1)]
         rows = []
-        for lo, hi, name in bins:
-            ids = [t for t in have if lo <= rs[t]["deficit"] < hi and t in gs and t in ls]
+        for name, contains in bins:
+            ids = [t for t in have if contains(rs[t]["deficit"]) and t in gs and t in ls]
             if ids:
                 d = [gs[i][metric] - ls[i][metric] for i in ids]
                 rows.append({"дефицит": name, "n": len(ids), "last": _mean([ls[i][metric] for i in ids]),

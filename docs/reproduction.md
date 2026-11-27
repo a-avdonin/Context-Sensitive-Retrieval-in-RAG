@@ -117,7 +117,7 @@ arag answers-summary --dataset mtragun --slice later_turns --baseline route/llm_
 arag answers-summary --dataset mtragun --slice later_turns --baseline route/llm_nohist_rewrite --metric completeness
 ```
 
-Ожидается 332 задачи с qrels, включая 309 последующих ходов. В сводке ответов `n` — количество ответов, `judged` — количество ответов с валидными оценками судьи. [Отчёт MTRAG-UN](results/mtragun.md)
+Ожидается 332 задачи с qrels, включая 309 последующих ходов. Для переноса после исключения общих диалогов остаются 303 задачи, из них 283 последующих хода. Парные тесты используют общие ID сравниваемых систем. В сводке ответов `n` — количество ответов, `judged` — количество ответов с валидными оценками судьи. [Отчёт MTRAG-UN](results/mtragun.md)
 
 ## Файлы прогонов и повторный запуск
 

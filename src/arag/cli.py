@@ -7,7 +7,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from .config import load_config
-from .data import DOMAINS, load_tasks
+from .data import DOMAINS, held_out_dialogues, load_tasks
 from .llm import LLM, parallel_map
 from .metrics import aggregate, per_query, read_jsonl, records_to_run, write_jsonl
 from .pipeline import Engine, Strategy, all_strategies, record_to_dict
@@ -253,9 +253,10 @@ def cmd_significance(cfg, args):
             continue
         a = np.array([base[q][args.metric] for q in common])
         b = np.array([sc[q][args.metric] for q in common])
-        delta, lo, hi = paired_bootstrap(a, b, args.n)
+        groups = [by[q].conversation_id for q in common]
+        delta, lo, hi = paired_bootstrap(a, b, args.n, groups=groups)
         rows.append({"system": s, "n": len(common), "baseline": a.mean(), "system_score": b.mean(),
-                     "delta": delta, "ci_low": lo, "ci_high": hi, "p": randomization_test(a, b, args.n)})
+                     "delta": delta, "ci_low": lo, "ci_high": hi, "p": randomization_test(a, b, args.n, groups=groups)})
     for r, p in zip(rows, holm([r["p"] for r in rows])):
         r["p_holm"] = p
     print(f"baseline={args.baseline}  metric={args.metric}  slice={args.slice}\n")
@@ -275,6 +276,9 @@ def cmd_route(cfg, args):
         if train_dataset:
             train_tasks, train_qrels = load_tasks(cfg["data_dir"], train_dataset)
             train_tasks = [t for t in train_tasks if t.meta["has_qrels"]]
+            held_out = held_out_dialogues(train_tasks, tasks)
+            print(f"Для переноса исключено задач с общим ID или началом диалога: {len(tasks) - len(held_out)}")
+            tasks = held_out
             rep = router.prepare_transfer(train_dataset, train_tasks, train_qrels, tasks)
             print(f"adaptive_rag: обучение на {train_dataset}, применение к {args.dataset}")
         else:
@@ -451,9 +455,10 @@ def cmd_answers_summary(cfg, args):
                 continue
             a = np.array([base[q][args.metric] for q in common], float)
             b = np.array([sc[q][args.metric] for q in common], float)
-            delta, lo, hi = paired_bootstrap(a, b, args.n)
+            groups = [by[q].conversation_id for q in common]
+            delta, lo, hi = paired_bootstrap(a, b, args.n, groups=groups)
             cmp_rows.append({"system": s, "n": len(common), "baseline": a.mean(), "system_score": b.mean(),
-                             "delta": delta, "ci_low": lo, "ci_high": hi, "p": randomization_test(a, b, args.n)})
+                             "delta": delta, "ci_low": lo, "ci_high": hi, "p": randomization_test(a, b, args.n, groups=groups)})
         for r, p in zip(cmp_rows, holm([r["p"] for r in cmp_rows])):
             r["p_holm"] = p
         print(f"\nbaseline={args.baseline}  metric={args.metric}\n")

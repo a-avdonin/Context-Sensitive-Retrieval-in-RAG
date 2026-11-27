@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .data import Task
+from .data import Task, held_out_dialogues
 from .llm import LLM, format_history, parse_json
 from .pipeline import Strategy
 
@@ -216,7 +216,7 @@ class AdaptiveRAGRouter:
         scores = self._level_scores(tasks, qrels)
         labels = [self.label(scores[t.task_id], self.eps) for t in tasks]
         X, self.embed_ms = self._embeddings(tasks)
-        groups = np.array([t.task_id.split("<::>")[0] for t in tasks])
+        groups = np.array([t.conversation_id for t in tasks])
         y = np.array([-1 if l is None else l for l in labels])
         pred = np.zeros(len(tasks), dtype=int)
         conf = np.zeros(len(tasks))
@@ -244,9 +244,7 @@ class AdaptiveRAGRouter:
 
         if not train_tasks or not tasks:
             raise ValueError("Adaptive-RAG: для переноса нужны непустые обучающая и тестовая выборки")
-        train_groups = {t.task_id.split("<::>", 1)[0] for t in train_tasks}
-        test_groups = {t.task_id.split("<::>", 1)[0] for t in tasks}
-        if train_groups & test_groups:
+        if len(held_out_dialogues(train_tasks, tasks)) != len(tasks):
             raise ValueError("Adaptive-RAG: обучающая и тестовая выборки содержат общие диалоги")
         scores = self._level_scores(train_tasks, train_qrels, train_dataset)
         labeled = [(t, level) for t in train_tasks if (level := self.label(scores[t.task_id], self.eps)) is not None]

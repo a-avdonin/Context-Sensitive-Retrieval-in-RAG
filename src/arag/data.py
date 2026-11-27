@@ -32,6 +32,14 @@ class Task:
     meta: dict = field(default_factory=dict)
 
     @property
+    def conversation_id(self) -> str:
+        return self.task_id.split("<::>", 1)[0]
+
+    @property
+    def opening(self) -> str:
+        return " ".join(self.turns[0]["text"].casefold().split())
+
+    @property
     def query(self) -> str:
         return self.turns[-1]["text"].strip()
 
@@ -88,3 +96,11 @@ def load_tasks(root: str, dataset: str = "mtrag", domains: list[str] | None = No
             turns = [{"speaker": t["speaker"], "text": t["text"]} for t in r["input"]]
             tasks.append(Task(r["task_id"], d, turns, r.get("rewritten_query"), meta))
     return tasks, qrels
+
+
+def held_out_dialogues(train_tasks: list[Task], tasks: list[Task]) -> list[Task]:
+    """Исключаем целые целевые диалоги с общим ID или текстом начальной реплики."""
+    source_ids = {t.conversation_id for t in train_tasks}
+    openings = {t.opening for t in train_tasks}
+    excluded = source_ids | {t.conversation_id for t in tasks if t.opening in openings}
+    return [t for t in tasks if t.conversation_id not in excluded]
