@@ -31,109 +31,77 @@ arag index
 
 ## MTRAG
 
-Запустите 30 фиксированных стратегий, постройте оракул и сравните роутеры. Подсчёт метрик использует сохранённые прогоны. Запуск `arag route` переиспользует их для выбранных комбинаций поиска.
+Команды ниже рассчитаны на Bash или Zsh и отдельный пустой каталог прогонов при воспроизведении с нуля. Сначала запустите 18 стратегий и сохраните выбор оракула. Затем расширьте поиск до 30 стратегий, включая CHIQ и человеческие формулировки. Такой порядок воспроизводит строку оракула в README.
 
 ```bash
-arag run --dataset mtrag --strategies all
-arag eval --dataset mtrag --slice later_turns
+arag run --dataset mtrag --strategies {last,user_concat,llm_rewrite}:{bm25,dense,hybrid}{,+rerank}
 arag oracle --dataset mtrag
-arag analyze --dataset mtrag
-
-for strategy in last:bm25 last:dense last:hybrid+rerank llm_rewrite:dense+rerank; do
-  arag route --dataset mtrag --router fixed --fixed "$strategy"
-done
-for router in rule llm_nohist llm_hist adaptive_rag oracle oracle_cheap; do
+for router in oracle oracle_cheap; do
   arag route --dataset mtrag --router "$router"
 done
 
-arag routes-summary --dataset mtrag --slice later_turns
-arag significance --dataset mtrag --slice later_turns --baseline 'llm_rewrite:dense+rerank'
-arag significance --dataset mtrag --slice later_turns --baseline route/llm_nohist
-```
-
-Оцените девять систем и воспроизведите калибровку судьи на ответах с человеческими оценками.
-
-```bash
-arag judge-calibrate --out runs/judge_calibration_qwen_v2.md
-arag answer --dataset mtrag --run \
-  'runs/mtrag/last__dense.jsonl' \
-  'runs/mtrag/last__hybrid+rerank.jsonl' \
-  'runs/mtrag/llm_rewrite__dense+rerank.jsonl' \
-  'runs/mtrag/chiq__dense+rerank.jsonl' \
-  runs/mtrag_routes/{rule,adaptive_rag,llm_hist,llm_nohist,oracle}.jsonl
-
-for slice in later_turns all; do
-  arag answers-summary --dataset mtrag --slice "$slice" --baseline 'llm_rewrite:dense+rerank'
+arag run --dataset mtrag --strategies all
+arag analyze --dataset mtrag
+for strategy in last:bm25 last:dense last:hybrid+rerank llm_rewrite:dense+rerank; do
+  arag route --dataset mtrag --router fixed --fixed "$strategy"
 done
+for router in rule llm_nohist llm_hist adaptive_rag; do
+  arag route --dataset mtrag --router "$router"
+done
+
+arag answer --dataset mtrag --k 5 --run \
+  runs/mtrag/{last__bm25,last__dense,last__dense+rerank,last__hybrid+rerank}.jsonl \
+  runs/mtrag/{llm_rewrite__dense+rerank,llm_rewrite__hybrid+rerank,chiq__dense+rerank,gold_rewrite__dense+rerank}.jsonl \
+  runs/mtrag_routes/{rule,llm_nohist,llm_hist,adaptive_rag,oracle}.jsonl
 ```
 
-Ожидается 777 задач с qrels, включая 675 последующих ходов. [Поисковый отчёт](results/mtrag_analysis.md) · [Отчёт по ответам](results/mtrag_answers.md) · [Калибровка судьи](results/judge_calibration_qwen_v2.md)
+Ожидаются ответы 13 систем по 777 задачам с qrels, включая 675 последующих ходов. Отдельная команда `arag judge-calibrate --out runs/judge_calibration_qwen_v2.md` проверяет судью на ответах с человеческими оценками. [Калибровка v2](results/judge_calibration_qwen_v2.md)
 
 ## MTRAG-UN
 
-Для переноса Adaptive-RAG обязательны полные прогоны трёх уровней на MTRAG. Если полный блок MTRAG выше пропущен, восстановите эти три прогона отдельно.
+Сохраните решения оракула по 12 исходным конфигурациям до запуска CHIQ. Для переноса нужны сохранённые прогоны трёх уровней Adaptive-RAG из блока MTRAG.
 
 ```bash
-arag run --dataset mtrag --strategies last:dense last:dense+rerank llm_rewrite:dense+rerank
-```
+arag run --dataset mtragun --strategies {last,llm_rewrite}:{bm25,dense,hybrid}{,+rerank}
+arag oracle --dataset mtragun
+arag route --dataset mtragun --router oracle
+arag run --dataset mtragun --strategies chiq:dense+rerank
 
-Основной эксперимент MTRAG-UN включает 12 стратегий, два режима обучения Adaptive-RAG и пару для проверки вклада истории. Команды с `--train-dataset` и без него пишут отдельные прогоны.
-
-```bash
-arag run --dataset mtragun --strategies \
-  last:bm25 last:dense last:hybrid \
-  last:bm25+rerank last:dense+rerank last:hybrid+rerank \
-  llm_rewrite:bm25 llm_rewrite:dense llm_rewrite:hybrid \
-  llm_rewrite:bm25+rerank llm_rewrite:dense+rerank llm_rewrite:hybrid+rerank
-
-arag route --dataset mtragun --router fixed --fixed 'llm_rewrite:dense+rerank'
+arag route --dataset mtragun --router fixed --fixed llm_rewrite:dense+rerank
 for router in rule llm_nohist llm_hist llm_nohist_rewrite adaptive_rag; do
   arag route --dataset mtragun --router "$router"
 done
 arag route --dataset mtragun --router adaptive_rag --train-dataset mtrag
 
-arag answer --dataset mtragun --run \
-  'runs/mtragun/llm_rewrite__dense+rerank.jsonl' \
-  'runs/mtragun/llm_rewrite__hybrid+rerank.jsonl' \
-  runs/mtragun_routes/{rule,llm_hist,llm_nohist,llm_nohist_rewrite,adaptive_rag,adaptive_rag_from_mtrag}.jsonl
+arag answer --dataset mtragun --k 5 --run \
+  runs/mtragun/{last__bm25,last__dense,last__dense+rerank,last__hybrid+rerank}.jsonl \
+  runs/mtragun/{llm_rewrite__dense+rerank,llm_rewrite__hybrid+rerank,chiq__dense+rerank}.jsonl \
+  runs/mtragun_routes/{rule,llm_nohist,llm_nohist_rewrite,llm_hist,adaptive_rag,adaptive_rag_from_mtrag,oracle}.jsonl
 ```
 
-### Сводки и парные тесты
+Сводка включает 14 систем. Для переноса ожидаются 303 ответа, включая 283 последующих хода. Для остальных систем — 332 ответа, включая 309 последующих ходов.
 
-Для основного сравнения используйте фиксированный dense-пайплайн. Для проверки вклада истории смотрите строку `route/llm_hist` в парных тестах относительно `route/llm_nohist_rewrite`. Для прямого сравнения режимов Adaptive-RAG смотрите строку `route/adaptive_rag_from_mtrag` относительно `route/adaptive_rag`.
+## Сводки и парные тесты
+
+Команды читают сохранённые прогоны. Для сравнения по Correctness применяется `answers-summary`, для nDCG@5 — `significance`.
 
 ```bash
-arag eval --dataset mtragun --slice later_turns
-for slice in later_turns all; do
-  arag routes-summary --dataset mtragun --slice "$slice"
-  arag answers-summary --dataset mtragun --slice "$slice" --baseline 'llm_rewrite:dense+rerank'
+for ds in mtrag mtragun; do
+  arag eval --dataset "$ds" --slice later_turns
+  for slice in all later_turns; do
+    arag routes-summary --dataset "$ds" --slice "$slice"
+    arag answers-summary --dataset "$ds" --slice "$slice" --baseline llm_rewrite:dense+rerank
+  done
+  arag significance --dataset "$ds" --slice later_turns --baseline llm_rewrite:dense+rerank
 done
-
-arag significance --dataset mtragun --slice later_turns --baseline 'llm_rewrite:dense+rerank'
-arag significance --dataset mtragun --slice later_turns --baseline route/adaptive_rag
-arag answers-summary --dataset mtragun --slice later_turns --baseline route/adaptive_rag
-arag significance --dataset mtragun --slice later_turns --baseline route/llm_nohist_rewrite
-arag answers-summary --dataset mtragun --slice later_turns --baseline route/llm_nohist_rewrite
-arag answers-summary --dataset mtragun --slice later_turns --baseline route/llm_nohist_rewrite --metric completeness
 ```
 
-Ожидается 332 задачи с qrels, включая 309 последующих ходов. Для переноса после исключения общих диалогов остаются 303 задачи, из них 283 последующих хода. Парные тесты используют общие ID сравниваемых систем. В сводке ответов `n` — количество ответов, `judged` — количество ответов с валидными оценками судьи. [Отчёт MTRAG-UN](results/mtragun.md)
+Для контроля истории на MTRAG-UN замените базу на `route/llm_nohist_rewrite` и прочитайте строку `route/llm_hist`. Для переноса сравните `route/adaptive_rag_from_mtrag` с базой `route/adaptive_rag`. Для Completeness добавьте к `answers-summary` аргумент `--metric completeness`. [Интерпретация парных тестов](methodology.md#значимость)
 
 ## Файлы прогонов и повторный запуск
 
-| Артефакт | Путь по умолчанию |
-|---|---|
-| Результаты стратегий | `runs/<dataset>/<strategy>.jsonl`. В имени файла двоеточие заменено на `__`. |
-| Результаты роутеров | `runs/<dataset>_routes/<router>.jsonl`. |
-| Ответы и оценки судьи | `runs/<dataset>_answers/*.jsonl`. |
-| Сводки | `runs/<dataset>_summary.csv`, `runs/<dataset>_routes_summary_<slice>.csv`, `runs/<dataset>_answers_summary_<slice>.csv`. |
-| Метки оракула и анализ поиска | `runs/<dataset>_oracle.jsonl`, `runs/<dataset>_analysis.md`. |
-| Калибровка судьи | `runs/judge_calibration_<model>.md` и одноимённый JSONL. |
+Поиск сохраняется в `runs/<dataset>/`, выбор роутера — в `runs/<dataset>_routes/`, ответы и оценки судьи — в `runs/<dataset>_answers/`. В имени файла стратегии двоеточие заменяется на `__`. CSV-сводки находятся непосредственно в `runs/`. Поля `n` и `judged` показывают число ответов и число валидных оценок. В Git хранятся отчёты, а данные, индексы, кэш и JSONL-прогоны остаются локально.
 
-Команда `run` пропускает готовые файлы стратегий. Для пилотов с `--limit` или `--domains` задайте отдельный `runs_dir` в копии конфигурации и запускайте `arag --config <файл> <команда>`. Если усечённый файл уже записан, пересчитайте нужную стратегию с `--overwrite`. Параметр `answer --sample` выбирает одни и те же ID задач для всех переданных систем.
+Для обновления таблиц по готовым JSONL достаточно блока со сводками. Если имеются только поисковые прогоны, начните с соответствующей команды `arag answer`. Готовый выбор оракула используйте из `<dataset>_routes/oracle.jsonl`: команда `arag oracle` при повторном запуске строит метки по всем стратегиям, доступным в этот момент.
 
-Парные тесты применяют поправку Холма к сравнениям в одной таблице. Для воспроизведения скорректированных p-значений используйте тот же набор файлов стратегий, роутеров и ответов, что в соответствующем эксперименте.
-
-Ответы LLM, эмбеддинги и оценки пар реранкера переиспользуются из кэша. Для новых замеров задержки используйте отдельный кэш и `--workers 1` на этапах с LLM. В кэше остаётся время исходного вызова. При смене версии корпуса или параметров индексации используйте отдельный `cache_dir`, чтобы построить индексы заново.
-
-Каталоги `runs/`, `cache/` и `data/` исключены из Git. Сохранённые отчёты перечислены в [индексе документации](README.md). Справка по CLI доступна через `arag <команда> --help`.
+Для пилота задайте отдельный `runs_dir` в копии конфигурации и используйте `arag --config <файл> <команда>`: команда `run` пропускает существующие файлы. Для новых замеров задержки используйте отдельный `cache_dir` и `--workers 1` на этапах с LLM. При смене корпуса или параметров индексации перестройте индексы в новом каталоге кэша.
